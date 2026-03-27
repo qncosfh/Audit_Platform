@@ -17,9 +17,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // 审计服务日志器 - 避免在高频循环中打印日志
@@ -571,17 +574,8 @@ func (s *AuditService) executeAuditInternal(ctx context.Context, task *AuditTask
 
 	// 2. 并发分析文件 - 使用goroutine池（动态调整）
 	totalFiles := len(files)
-	// 根据CPU核心数和文件数量动态调整并发数
-	numCPU := runtime.NumCPU()
-	concurrentWorkers := numCPU
-	if concurrentWorkers > 8 {
-		concurrentWorkers = 8 // 最大8个并发
-	}
-	if totalFiles < 10 {
-		concurrentWorkers = 1
-	} else if totalFiles < 50 {
-		concurrentWorkers = 2
-	}
+	// 根据服务器性能和文件数量动态调整并发数（优先满worker）
+	concurrentWorkers := calculateOptimalWorkers(totalFiles)
 
 	s.appendLog(task, fmt.Sprintf("启动 %d 个并发 worker 进行分析...", concurrentWorkers))
 	updateTaskProgress(task, fmt.Sprintf("启动 %d 个并发 worker 进行分析...", concurrentWorkers))
@@ -3193,20 +3187,368 @@ func (s *AuditService) CleanupSandbox(taskID string) error {
 
 // ==================== Worker动态调整功能 ====================
 
-// calculateOptimalWorkers 根据服务器性能和文件数量动态计算最佳worker数量
+// ServerMetrics 服务器性能监控
+type ServerMetrics struct {
+	CPUPercent       float64   // CPU使用率 (0-100)
+	MemoryUsedGB     float64   // 已使用内存 (GB)
+	MemoryTotalGB    float64   // 总内存 (GB)
+	MemoryFreeGB     float64   // 可用内存 (GB)
+	AvailableWorkers int32     // 可用worker数量
+	LoadAverage      float64   // 系统负载 (Linux)
+	LastUpdate       time.Time // 最后更新时间
+	mu               sync.RWMutex
+}
+
+// GlobalServerMetrics 全局服务器性能监控实例
+var GlobalServerMetrics = &ServerMetrics{
+	LastUpdate: time.Now(),
+}
+
+// GetCurrentMetrics 获取当前服务器性能指标
+func (s *ServerMetrics) GetCurrentMetrics() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 获取CPU使用率
+	cpuPercent, err := cpu.Percent(time.Second, false)
+	if err == nil && len(cpuPercent) > 0 {
+		s.CPUPercent = cpuPercent[0]
+	}
+
+	// 获取内存信息
+	memInfo, err := mem.VirtualMemory()
+	if err == nil {
+		s.MemoryTotalGB = float64(memInfo.Total) / (1024 * 1024 * 1024)
+		s.MemoryUsedGB = float64(memInfo.Used) / (1024 * 1024 * 1024)
+		s.MemoryFreeGB = float64(memInfo.Available) / (1024 * 1024 * 1024)
+	}
+
+	s.LastUpdate = time.Now()
+}
+
+// GetAvailableMemoryPercent 获取可用内存百分比
+func (s *ServerMetrics) GetAvailableMemoryPercent() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.MemoryTotalGB > 0 {
+		return (s.MemoryFreeGB / s.MemoryTotalGB) * 100
+	}
+	return 50.0 // 默认值
+}
+
+// GetCPUUsageLevel 获取CPU使用级别 (0-100 -> 0.0-1.0)
+func (s *ServerMetrics) GetCPUUsageLevel() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CPUPercent / 100.0
+}
+
+// DynamicWorkerPool 动态Worker池
+type DynamicWorkerPool struct {
+	minWorkers     int32             // 最小worker数
+	maxWorkers     int32             // 最大worker数
+	currentWorkers int32             // 当前worker数
+	activeWorkers  int32             // 活跃worker数
+	metrics        *ServerMetrics    // 服务器性能监控
+	fileQueue      chan string       // 文件队列
+	resultQueue    chan *AuditResult // 结果队列
+	totalFiles     int               // 总文件数
+	processedFiles int32             // 已处理文件数
+	mu             sync.RWMutex      // 互斥锁
+	stopCh         chan struct{}     // 停止信号
+	adjustTicker   *time.Ticker      // 调整定时器
+	adjustInterval time.Duration     // 调整间隔
+	isRunning      bool              // 是否运行中
+}
+
+// NewDynamicWorkerPool 创建动态Worker池
+func NewDynamicWorkerPool(minWorkers, maxWorkers int) *DynamicWorkerPool {
+	if minWorkers < 1 {
+		minWorkers = 1
+	}
+	if maxWorkers > 32 {
+		maxWorkers = 32 // 最多32个worker
+	}
+	if maxWorkers < minWorkers {
+		maxWorkers = minWorkers
+	}
+
+	pool := &DynamicWorkerPool{
+		minWorkers:     int32(minWorkers),
+		maxWorkers:     int32(maxWorkers),
+		currentWorkers: int32(minWorkers),
+		activeWorkers:  0,
+		metrics:        GlobalServerMetrics,
+		fileQueue:      make(chan string, 1000),
+		resultQueue:    make(chan *AuditResult, 1000),
+		stopCh:         make(chan struct{}),
+		adjustInterval: 5 * time.Second, // 每5秒调整一次
+	}
+
+	return pool
+}
+
+// StartWithFiles 开始处理文件
+func (p *DynamicWorkerPool) StartWithFiles(files []string, totalFiles int, processFunc func(file string, workerID int) *AuditResult) {
+	p.mu.Lock()
+	if p.isRunning {
+		p.mu.Unlock()
+		return
+	}
+	p.isRunning = true
+	p.totalFiles = totalFiles
+	p.processedFiles = 0
+	p.stopCh = make(chan struct{})
+	p.mu.Unlock()
+
+	// 启动性能监控
+	go p.monitorPerformance()
+
+	// 启动动态调整
+	go p.dynamicAdjust()
+
+	// 启动worker池
+	for i := int32(0); i < p.currentWorkers; i++ {
+		go p.worker(i, processFunc)
+	}
+
+	// 发送文件到队列
+	go func() {
+		for _, file := range files {
+			select {
+			case p.fileQueue <- file:
+			case <-p.stopCh:
+				return
+			}
+		}
+		// 关闭文件队列
+		close(p.fileQueue)
+	}()
+}
+
+// worker Worker处理函数
+func (p *DynamicWorkerPool) worker(workerID int32, processFunc func(file string, workerID int) *AuditResult) {
+	atomic.AddInt32(&p.activeWorkers, 1)
+	defer atomic.AddInt32(&p.activeWorkers, -1)
+
+	for file := range p.fileQueue {
+		select {
+		case <-p.stopCh:
+			return
+		default:
+			// 处理文件
+			result := processFunc(file, int(workerID))
+			if result != nil {
+				select {
+				case p.resultQueue <- result:
+				case <-p.stopCh:
+					return
+				}
+			}
+			atomic.AddInt32(&p.processedFiles, 1)
+		}
+	}
+}
+
+// monitorPerformance 监控服务器性能
+func (p *DynamicWorkerPool) monitorPerformance() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			// 更新性能指标
+			p.metrics.GetCurrentMetrics()
+		}
+	}
+}
+
+// dynamicAdjust 动态调整worker数量
+func (p *DynamicWorkerPool) dynamicAdjust() {
+	ticker := time.NewTicker(p.adjustInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.adjustWorkers()
+		}
+	}
+}
+
+// adjustWorkers 根据性能指标调整worker数量
+func (p *DynamicWorkerPool) adjustWorkers() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	metrics := p.metrics
+	metrics.GetCurrentMetrics()
+
+	// 获取当前状态
+	currentWorkers := p.currentWorkers
+	availableMemory := metrics.GetAvailableMemoryPercent()
+	cpuUsage := metrics.GetCPUUsageLevel()
+
+	// 计算目标worker数
+	var targetWorkers int32
+
+	// 策略1: 如果CPU和内存都充足，优先满worker
+	if cpuUsage < 0.5 && availableMemory > 50 {
+		// 性能充足，增加worker
+		targetWorkers = currentWorkers + 1
+		auditLogger.Printf("[动态Worker] 性能充足，增加worker: %d -> %d (CPU: %.1f%%, 内存可用: %.1f%%)",
+			currentWorkers, targetWorkers, metrics.CPUPercent, availableMemory)
+	} else if cpuUsage > 0.85 || availableMemory < 20 {
+		// 性能不足，减少worker
+		targetWorkers = currentWorkers - 1
+		auditLogger.Printf("[动态Worker] 性能不足，减少worker: %d -> %d (CPU: %.1f%%, 内存可用: %.1f%%)",
+			currentWorkers, targetWorkers, metrics.CPUPercent, availableMemory)
+	} else {
+		// 性能适中，保持不变
+		targetWorkers = currentWorkers
+	}
+
+	// 确保在范围内
+	if targetWorkers < p.minWorkers {
+		targetWorkers = p.minWorkers
+	}
+	if targetWorkers > p.maxWorkers {
+		targetWorkers = p.maxWorkers
+	}
+
+	// 如果目标worker数改变
+	if targetWorkers != currentWorkers {
+		p.currentWorkers = targetWorkers
+
+		// 如果需要增加worker，启动新的worker
+		if targetWorkers > currentWorkers {
+			diff := targetWorkers - currentWorkers
+			for i := int32(0); i < diff; i++ {
+				go p.worker(currentWorkers+i, nil) // 将在下次循环中使用新的processFunc
+			}
+		}
+		// 如果需要减少worker，通过减少文件处理来间接减少
+		// (活跃的worker会自然完成并退出)
+	}
+}
+
+// GetResults 获取所有结果
+func (p *DynamicWorkerPool) GetResults() []*AuditResult {
+	var results []*AuditResult
+
+	p.mu.RLock()
+	total := p.totalFiles
+	p.mu.RUnlock()
+
+	timeout := time.After(30 * time.Minute) // 超时30分钟
+
+	for len(results) < int(atomic.LoadInt32(&p.processedFiles)) || !p.isQueueClosed() {
+		select {
+		case result, ok := <-p.resultQueue:
+			if !ok {
+				return results
+			}
+			results = append(results, result)
+		case <-timeout:
+			auditLogger.Printf("[动态Worker] 获取结果超时，已获取 %d 个结果", len(results))
+			return results
+		case <-p.stopCh:
+			return results
+		default:
+			// 检查是否所有文件都已处理
+			if atomic.LoadInt32(&p.processedFiles) >= int32(total) {
+				// 关闭结果队列
+				close(p.resultQueue)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	return results
+}
+
+// isQueueClosed 检查文件队列是否已关闭
+func (p *DynamicWorkerPool) isQueueClosed() bool {
+	select {
+	case _, ok := <-p.fileQueue:
+		if ok {
+			// 重新放回
+			go func() { p.fileQueue <- "" }()
+		}
+		return !ok
+	default:
+		return false
+	}
+}
+
+// Stop 停止Worker池
+func (p *DynamicWorkerPool) Stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.isRunning {
+		return
+	}
+
+	p.isRunning = false
+	close(p.stopCh)
+
+	// 关闭所有channel
+	close(p.resultQueue)
+}
+
+// GetProgress 获取处理进度
+func (p *DynamicWorkerPool) GetProgress() (processed, total int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return int(atomic.LoadInt32(&p.processedFiles)), p.totalFiles
+}
+
+// GetCurrentWorkers 获取当前worker数量
+func (p *DynamicWorkerPool) GetCurrentWorkers() int32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.currentWorkers
+}
+
+// GetMetrics 获取性能指标
+func (p *DynamicWorkerPool) GetMetrics() *ServerMetrics {
+	p.metrics.GetCurrentMetrics()
+	return p.metrics
+}
+
+// calculateOptimalWorkers 根据服务器性能和文件数量动态计算最佳worker数量（增强版）
 func calculateOptimalWorkers(totalFiles int) int {
+	// 优先满worker：获取服务器实际性能
+	metrics := GlobalServerMetrics
+	metrics.GetCurrentMetrics()
+
 	// 获取CPU核心数
 	numCPU := runtime.NumCPU()
 
-	// 获取内存信息（单位：字节）
-	var memStats runtime.MemStats
-	runtime.ReadMemStats(&memStats)
-	totalMemoryGB := memStats.Sys / (1024 * 1024 * 1024) // 转换为GB
+	// 获取内存信息
+	memInfo, err := mem.VirtualMemory()
+	var totalMemoryGB, availableMemoryGB float64
+	if err == nil {
+		totalMemoryGB = float64(memInfo.Total) / (1024 * 1024 * 1024)
+		availableMemoryGB = float64(memInfo.Available) / (1024 * 1024 * 1024)
+	} else {
+		// 回退到runtime.MemStats
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		totalMemoryGB = float64(memStats.Sys) / (1024 * 1024 * 1024)
+		availableMemoryGB = totalMemoryGB * 0.3 // 估算
+	}
 
-	// 根据文件数量确定基础worker数
+	// 根据文件数量确定基础worker数（优先满worker）
 	baseWorkers := numCPU
-	if baseWorkers > 16 {
-		baseWorkers = 16 // 最多16个worker
+	if baseWorkers > 24 {
+		baseWorkers = 24 // 最多24个worker（高性能服务器）
 	}
 	if baseWorkers < 2 {
 		baseWorkers = 2 // 最少2个worker
@@ -3214,35 +3556,104 @@ func calculateOptimalWorkers(totalFiles int) int {
 
 	// 根据文件数量调整
 	if totalFiles < 10 {
-		baseWorkers = 1
+		baseWorkers = 2
 	} else if totalFiles < 50 {
-		baseWorkers = min(2, baseWorkers)
-	} else if totalFiles < 100 {
 		baseWorkers = min(4, baseWorkers)
-	} else if totalFiles < 500 {
+	} else if totalFiles < 100 {
 		baseWorkers = min(6, baseWorkers)
-	} else {
+	} else if totalFiles < 200 {
 		baseWorkers = min(8, baseWorkers)
+	} else if totalFiles < 500 {
+		baseWorkers = min(12, baseWorkers)
+	} else {
+		baseWorkers = min(16, baseWorkers)
 	}
 
-	// 根据可用内存调整（每GB内存支持约2个worker）
-	maxWorkersByMem := int(totalMemoryGB * 2)
+	// 性能调整因子
+	cpuUsage := metrics.GetCPUUsageLevel()
+	memoryAvailablePercent := (availableMemoryGB / totalMemoryGB) * 100
+
+	// 动态调整
+	performanceScore := (1.0-cpuUsage)*0.5 + (memoryAvailablePercent/100.0)*0.5
+
+	// 根据性能分数调整
+	var optimalWorkers int
+	if performanceScore >= 0.8 {
+		// 性能充足，优先满worker，使用更高的worker数
+		optimalWorkers = baseWorkers
+		auditLogger.Printf("[动态Worker] 性能充足，启用满worker模式: %d workers (CPU: %.1f%%, 内存可用: %.1f%%)",
+			optimalWorkers, metrics.CPUPercent, memoryAvailablePercent)
+	} else if performanceScore >= 0.5 {
+		// 性能适中，使用适中的worker数
+		optimalWorkers = baseWorkers / 2
+		if optimalWorkers < 2 {
+			optimalWorkers = 2
+		}
+		auditLogger.Printf("[动态Worker] 性能适中，平衡模式: %d workers (CPU: %.1f%%, 内存可用: %.1f%%)",
+			optimalWorkers, metrics.CPUPercent, memoryAvailablePercent)
+	} else {
+		// 性能不足，降低worker数
+		optimalWorkers = baseWorkers / 4
+		if optimalWorkers < 1 {
+			optimalWorkers = 1
+		}
+		auditLogger.Printf("[动态Worker] 性能不足，节能模式: %d workers (CPU: %.1f%%, 内存可用: %.1f%%)",
+			optimalWorkers, metrics.CPUPercent, memoryAvailablePercent)
+	}
+
+	// 内存限制检查
+	maxWorkersByMem := int(availableMemoryGB * 2) // 每GB可用内存支持约2个worker
 	if maxWorkersByMem < 1 {
 		maxWorkersByMem = 1
 	}
 
-	// 取两者的最小值，避免内存不足
-	optimalWorkers := min(baseWorkers, maxWorkersByMem)
+	// 取两者的最小值
+	optimalWorkers = min(optimalWorkers, maxWorkersByMem)
 
 	// 确保至少1个worker
 	if optimalWorkers < 1 {
 		optimalWorkers = 1
 	}
 
-	auditLogger.Printf("动态worker计算: CPU=%d核, 内存=%.1fGB, 文件数=%d, 最佳worker数=%d",
-		numCPU, totalMemoryGB, totalFiles, optimalWorkers)
+	auditLogger.Printf("[动态Worker] 最终worker数=%d (CPU=%d核, 内存=%.1fGB/%.1fGB, 文件数=%d, 性能分数=%.2f)",
+		optimalWorkers, numCPU, availableMemoryGB, totalMemoryGB, totalFiles, performanceScore)
 
 	return optimalWorkers
+}
+
+// calculateMaxWorkersForServer 根据服务器配置计算最大worker数
+func calculateMaxWorkersForServer() int {
+	// 获取CPU核心数
+	numCPU := runtime.NumCPU()
+
+	// 获取内存信息
+	memInfo, err := mem.VirtualMemory()
+	var totalMemoryGB float64
+	if err == nil {
+		totalMemoryGB = float64(memInfo.Total) / (1024 * 1024 * 1024)
+	} else {
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		totalMemoryGB = float64(memStats.Sys) / (1024 * 1024 * 1024)
+	}
+
+	// 计算最大worker数：取CPU和内存支持的最大值
+	// CPU: 每核心支持1-2个worker
+	// 内存: 每GB支持约2个worker
+	maxByCPU := numCPU * 2
+	maxByMem := int(totalMemoryGB * 2)
+
+	maxWorkers := min(maxByCPU, maxByMem)
+
+	// 设置上限
+	if maxWorkers > 32 {
+		maxWorkers = 32
+	}
+	if maxWorkers < 2 {
+		maxWorkers = 2
+	}
+
+	return maxWorkers
 }
 
 // ==================== 新增功能 ====================
