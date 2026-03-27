@@ -6,56 +6,8 @@
 
 ![Platform Preview](./frontend/hhh.jpeg)
 
-## ✨ 特性
-
-### 🤖 AI 驱动的代码分析
-- 支持多种编程语言：Java、Python、Go、PHP、JavaScript/TypeScript、C#、Ruby、Swift、Kotlin、Rust 等
-- 智能漏洞识别与分类（SQL注入、命令注入、XSS、路径遍历、反序列化等）
-- 漏洞复查验证机制，降低误报率
-
-### 🔗 深度代码分析
-- 跨文件调用链分析，构建完整的函数调用图
-- 利用链追踪，发现潜在的深层漏洞
-- 支持沙箱环境隔离执行
-
-### 📊 可视化仪表盘
-- 宇宙星空视图展示任务状态
-- 漏洞态势统计（Critical/High/Medium/Low）
-- 系统资源监控（CPU、内存、磁盘、网络）
-
-### 🔄 实时审计流程
-- WebSocket 实时进度推送
-- 多并发 Worker 并行分析
-- 自动生成 Markdown 格式审计报告
-
-### 🌐 国际化支持
-- 中文、英文双语支持
-- 响应式界面设计
-
-## 🏗️ 技术栈
-
-### 后端
-- **语言**: Go 1.21+
-- **框架**: Gin Web Framework
-- **数据库**: PostgreSQL 15
-- **AI 集成**: OpenAI API 兼容接口
-- **通信**: WebSocket 实时推送
-- **安全**: JWT 认证、沙箱隔离
-
-### 前端
-- **框架**: Vue 3 + TypeScript
-- **UI 库**: Element Plus
-- **状态管理**: Pinia
-- **路由**: Vue Router 4
-- **国际化**: Vue I18n
-- **图表**: ECharts
-- **图形可视化**: Cytoscape.js
 
 ## 🚀 快速开始
-
-### 环境要求
-- Docker & Docker Compose
-- Git
 
 ### 1. 克隆项目
 
@@ -242,5 +194,5 @@ platform/
 5. 创建 Pull Request
 
 ## 📄 许可证
-
 本项目采用 ISC 许可证。详见 [LICENSE](LICENSE) 文件。
+

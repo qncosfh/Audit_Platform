@@ -245,15 +245,23 @@ func (a *CodeAnalyzer) AnalyzeCallGraph() []MethodCall {
 	return calls
 }
 
-// getMethodCallPattern 根据语言获取方法调用正则
+// getMethodCallPattern 根据语言获取方法调用正则（扩展支持多语言）
 func (a *CodeAnalyzer) getMethodCallPattern() *regexp.Regexp {
 	patterns := map[string]string{
-		"java":   `(\w+)\.(\w+)\s*\(`,
-		"php":    `\$(\w+)->(\w+)\s*\(|(\w+)\((\w+)\s*\)|(\w+)::(\w+)\s*\(`,
-		"python": `(\w+)\.(\w+)\s*\(|(\w+)\s+=\s+(\w+)\(`,
-		"csharp": `(\w+)\.(\w+)\s*\(`,
-		"go":     `(\w+)\.(\w+)\s*\(`,
-		"js":     `(\w+)\.(\w+)\s*\(`,
+		"java":       `(\w+)\.(\w+)\s*\(`,
+		"php":        `\$(\w+)->(\w+)\s*\(|(\w+)\((\w+)\s*\)|(\w+)::(\w+)\s*\(`,
+		"python":     `(\w+)\.(\w+)\s*\(|(\w+)\s+=\s+(\w+)\(`,
+		"csharp":     `(\w+)\.(\w+)\s*\(`,
+		"go":         `(\w+)\.(\w+)\s*\(`,
+		"js":         `(\w+)\.(\w+)\s*\(`,
+		"typescript": `(\w+)\.(\w+)\s*\(`,
+		"rust":       `(\w+)::(\w+)\s*\(|(\w+)\.(\w+)\s*\(`,
+		"kotlin":     `(\w+)\.(\w+)\s*\(`,
+		"scala":      `(\w+)\.(\w+)\s*\(|(\w+)\s+(\w+)\s*\(`,
+		"ruby":       `(\w+)\.(\w+)\s*\(|(\w+)\s+(\w+)\s*\(`,
+		"swift":      `(\w+)\.(\w+)\s*\(`,
+		"dart":       `(\w+)\.(\w+)\s*\(`,
+		"groovy":     `(\w+)\.(\w+)\s*\(`,
 	}
 
 	pattern := patterns[a.Language]
@@ -320,65 +328,67 @@ func (a *CodeAnalyzer) FindTaintSources() []string {
 	return sources
 }
 
-// getTaintPatterns 根据语言获取污点源模式
+// getTaintPatterns 根据语言获取污点源模式（扩展支持更多语言）
 func (a *CodeAnalyzer) getTaintPatterns() []string {
 	patterns := map[string][]string{
 		"java": {
-			"request.getParameter",
-			"request.getHeader",
-			"HttpServletRequest",
-			"@RequestParam",
-			"@RequestBody",
-			"@PathVariable",
-			"BufferedReader",
-			"Scanner",
-			"DataInputStream",
-			"getCookies",
-			"HttpSession.getAttribute",
-			"ServletInputStream",
+			"request.getParameter", "request.getHeader", "HttpServletRequest",
+			"@RequestParam", "@RequestBody", "@PathVariable",
+			"BufferedReader", "Scanner", "DataInputStream",
+			"getCookies", "HttpSession.getAttribute", "ServletInputStream",
+			"@RequestHeader", "@CookieValue", "HttpServletRequestWrapper",
 		},
 		"php": {
-			"$_GET",
-			"$_POST",
-			"$_REQUEST",
-			"$_COOKIE",
-			"$_SERVER",
-			"file_get_contents",
-			"fopen",
-			"curl_exec",
-			"mysqli_query",
-			"PDO::query",
+			"$_GET", "$_POST", "$_REQUEST", "$_COOKIE", "$_SERVER",
+			"file_get_contents", "fopen", "curl_exec",
+			"mysqli_query", "PDO::query", "apache_request_headers",
 		},
 		"python": {
-			"request.",
-			"input(",
-			"sys.argv",
-			"os.environ",
-			"flask.request",
-			"django.request",
-			"fastapi.Request",
+			"request.", "input(", "sys.argv", "os.environ",
+			"flask.request", "django.request", "fastapi.Request",
+			"os.getenv", "sys.stdin", "argparse.ArgumentParser",
 		},
 		"csharp": {
-			"Request.QueryString",
-			"Request.Form",
-			"Request.Params",
-			"HttpContext.Request",
-			"RouteData.Values",
+			"Request.QueryString", "Request.Form", "Request.Params",
+			"HttpContext.Request", "RouteData.Values", "Request.Browser",
+			"Request.Cookies", "Request.UserHostAddress",
 		},
 		"js": {
-			"req.body",
-			"req.query",
-			"req.params",
-			"req.headers",
-			"process.argv",
-			"document.cookie",
+			"req.body", "req.query", "req.params", "req.headers",
+			"process.argv", "document.cookie", "window.location",
+			"localStorage", "sessionStorage",
+		},
+		"typescript": {
+			"req.body", "req.query", "req.params", "req.headers",
+			"process.argv", "express.Request",
 		},
 		"go": {
-			"r.FormValue",
-			"r.Form",
-			"r.PostForm",
-			"r.URL.Query",
-			"http.Request",
+			"r.FormValue", "r.Form", "r.PostForm", "r.URL.Query",
+			"http.Request", "r.FormFile", "r.Header",
+		},
+		"rust": {
+			"std::io::stdin", "std::env::args", "std::fs::read",
+			"std::net::TcpStream", "std::env::var",
+		},
+		"kotlin": {
+			"request.getParameter", "@RequestParam", "@RequestBody",
+			"readLine", "Scanner", "BufferedReader",
+		},
+		"scala": {
+			"request.getParameter", "scala.io.StdIn", "Source.stdin",
+			"play.api.mvc.Request",
+		},
+		"ruby": {
+			"params", "request", "env", "gets", "ARGF",
+			"Rails.application.config",
+		},
+		"swift": {
+			"readLine", "CommandLine.arguments", "FileHandle.standardInput",
+			"ProcessInfo.processInfo.environment",
+		},
+		"dart": {
+			"stdin.readLineSync", "Platform.environment",
+			"html.HttpRequest", "dart:io stdin",
 		},
 	}
 
@@ -406,76 +416,84 @@ func (a *CodeAnalyzer) FindSinks() []string {
 	return sinks
 }
 
-// getSinkPatterns 根据语言获取Sink点模式
+// getSinkPatterns 根据语言获取Sink点模式（扩展支持更多语言）
 func (a *CodeAnalyzer) getSinkPatterns() []string {
 	patterns := map[string][]string{
 		"java": {
-			"execute(",
-			"exec(",
-			"Runtime.getRuntime()",
-			"Statement.execute",
-			"PreparedStatement",
-			"createQuery",
-			"createSQLQuery",
-			"Hibernate",
-			"JDBC",
-			"ProcessBuilder",
-			"eval(",
-			"executeScript(",
-			"FileWriter",
-			"FileOutputStream",
-			"response.getWriter",
-			"ObjectInputStream",
+			"execute(", "exec(", "Runtime.getRuntime()",
+			"Statement.execute", "PreparedStatement",
+			"createQuery", "createSQLQuery",
+			"ProcessBuilder", "eval(", "executeScript(",
+			"FileWriter", "FileOutputStream",
+			"response.getWriter", "ObjectInputStream",
+			"new InitialContext().lookup",
 		},
 		"php": {
-			"eval(",
-			"exec(",
-			"system(",
-			"shell_exec(",
-			"passthru(",
-			"popen(",
-			"mysqli_query",
-			"mysql_query",
-			"PDO::exec",
-			"file_put_contents",
-			"file_get_contents",
-			"unserialize(",
-			"preg_replace",
-			"assert(",
+			"eval(", "exec(", "system(", "shell_exec(",
+			"passthru(", "popen(", "mysqli_query",
+			"mysql_query", "PDO::exec",
+			"file_put_contents", "file_get_contents",
+			"unserialize(", "preg_replace", "assert(",
+			"move_uploaded_file",
 		},
 		"python": {
-			"eval(",
-			"exec(",
-			"subprocess.",
-			"os.system(",
-			"os.popen(",
-			"pickle.load",
-			"yaml.load",
-			"sqlalchemy.text",
-			"cursor.execute",
+			"eval(", "exec(", "subprocess.",
+			"os.system(", "os.popen(",
+			"pickle.load", "yaml.load",
+			"sqlalchemy.text", "cursor.execute",
+			"render_template_string", "Template(",
 		},
 		"csharp": {
-			"Process.Start",
-			"Response.Write",
-			"Server.Execute",
-			"Eval(",
-			"DataAdapter.SelectCommand",
-			"SqlCommand.Execute",
+			"Process.Start", "Response.Write",
+			"Server.Execute", "Eval(",
+			"DataAdapter.SelectCommand", "SqlCommand.Execute",
+			"BinaryFormatter", "JavaScriptSerializer",
 		},
 		"js": {
-			"eval(",
-			"Function(",
-			"execScript",
-			"child_process.",
-			"require('child_process')",
-			".sql",
+			"eval(", "Function(", "execScript",
+			"child_process.", "require('child_process')",
+			"innerHTML", ".sql",
+		},
+		"typescript": {
+			"eval(", "new Function(",
+			"child_process.", "innerHTML",
+			"dangerouslySetInnerHTML",
 		},
 		"go": {
-			"exec.Command",
-			"os/exec",
-			"syscall.Exec",
-			"template.HTML",
-			"html/template",
+			"exec.Command", "os/exec", "syscall.Exec",
+			"template.HTML", "html/template",
+			"ioutil.ReadFile", "ioutil.WriteFile",
+		},
+		"rust": {
+			"std::process::Command", "std::fs::write",
+			"std::fs::read", "serde_json::from_str",
+			"bincode::deserialize",
+		},
+		"kotlin": {
+			"Runtime.getRuntime().exec",
+			"ProcessBuilder", "ObjectInputStream",
+			"readObject", "eval(",
+		},
+		"scala": {
+			"scala.util.evaluator", "System.exec",
+			"pickle.loads", "eval(",
+		},
+		"ruby": {
+			"eval(", "system(", "`", "Marshal.load",
+			"YAML.load", "File.write",
+		},
+		"swift": {
+			"Process(", "system(", "NSTask",
+			"Runtime.getInstance().exec",
+		},
+		"dart": {
+			"Process.run", "eval(", "dart:js",
+			"innerHtml", "compile()",
+		},
+		"groovy": {
+			"Eval.me(", "GroovyShell.evaluate",
+			"Runtime.getRuntime().exec",
+			"ProcessBuilder",
 		},
 	}
 
