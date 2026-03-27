@@ -17,9 +17,12 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/sashabaranov/go-openai"
+	"github.com/shirou/gopsutil/v3/cpu"
+	"github.com/shirou/gopsutil/v3/mem"
 )
 
 // 审计服务日志器 - 避免在高频循环中打印日志
@@ -449,7 +452,7 @@ func formatAuditResults(results []AuditResult) string {
 	return resultStr.String()
 }
 
-// AuditResult 审计结果
+// / AuditResult 审计结果
 type AuditResult struct {
 	Type          string    `json:"type"`
 	File          string    `json:"file"`
@@ -467,6 +470,43 @@ type AuditResult struct {
 	CodeSnippet   string    `json:"codeSnippet"`   // 漏洞代码片段
 	IsVerified    bool      `json:"isVerified"`    // 是否通过复查验证
 	VerifyResult  string    `json:"verifyResult"`  // 验证结果
+}
+
+// FileInfo 文件信息（用于项目结构分析）
+type FileInfo struct {
+	Path        string `json:"path"`        // 文件路径
+	IsDir       bool   `json:"isDir"`       // 是否目录
+	Size        int64  `json:"size"`        // 文件大小
+	Extension   string `json:"extension"`   // 扩展名
+	Priority    int    `json:"priority"`    // 优先级（1-10，数字越大优先级越高）
+	Category    string `json:"category"`    // 分类（业务代码/测试代码/配置/依赖/构建产物）
+	Language    string `json:"language"`    // 编程语言
+	Hash        string `json:"hash"`        // 文件哈希（用于增量分析）
+	ShouldAudit bool   `json:"shouldAudit"` // 是否应该审计
+	SkipReason  string `json:"skipReason"`  // 跳过原因
+}
+
+// ProjectStructure 项目结构分析结果
+type ProjectStructure struct {
+	RootPath        string         `json:"rootPath"`
+	TotalFiles      int            `json:"totalFiles"`
+	TotalDirs       int            `json:"totalDirs"`
+	TotalSize       int64          `json:"totalSize"`
+	Language        string         `json:"language"`
+	Files           []FileInfo     `json:"files"`           // 所有文件
+	BusinessFiles   []FileInfo     `json:"businessFiles"`   // 业务代码文件（高优先级）
+	TestFiles       []FileInfo     `json:"testFiles"`       // 测试代码文件
+	ConfigFiles     []FileInfo     `json:"configFiles"`     // 配置文件
+	DependencyFiles []FileInfo     `json:"dependencyFiles"` // 依赖文件（低优先级）
+	BuildArtifacts  []FileInfo     `json:"buildArtifacts"`  // 构建产物（不审计）
+	SkippedFiles    []FileInfo     `json:"skippedFiles"`    // 跳过的文件
+	FileTypeStats   map[string]int `json:"fileTypeStats"`   // 文件类型统计
+}
+
+// FileHashStore 文件哈希存储（用于增量分析）
+type FileHashStore struct {
+	mu     sync.RWMutex
+	hashes map[string]string // path -> hash
 }
 
 // AuditTask 审计任务
@@ -534,17 +574,8 @@ func (s *AuditService) executeAuditInternal(ctx context.Context, task *AuditTask
 
 	// 2. 并发分析文件 - 使用goroutine池（动态调整）
 	totalFiles := len(files)
-	// 根据CPU核心数和文件数量动态调整并发数
-	numCPU := runtime.NumCPU()
-	concurrentWorkers := numCPU
-	if concurrentWorkers > 8 {
-		concurrentWorkers = 8 // 最大8个并发
-	}
-	if totalFiles < 10 {
-		concurrentWorkers = 1
-	} else if totalFiles < 50 {
-		concurrentWorkers = 2
-	}
+	// 根据服务器性能和文件数量动态调整并发数（优先满worker）
+	concurrentWorkers := calculateOptimalWorkers(totalFiles)
 
 	s.appendLog(task, fmt.Sprintf("启动 %d 个并发 worker 进行分析...", concurrentWorkers))
 	updateTaskProgress(task, fmt.Sprintf("启动 %d 个并发 worker 进行分析...", concurrentWorkers))
@@ -969,28 +1000,25 @@ func detectLanguageFromFiles(files []string) string {
 
 // ==================== 漏洞去重逻辑 ====================
 
-// deduplicateVulnerabilities 去重漏洞列表
-// 去重条件：漏洞类型相同 且 文件路径相同
+// deduplicateVulnerabilities 去重漏洞列表（细粒度版）
+// 去重条件：漏洞类型 + 文件路径 + 代码位置(行号/方法名) + 危险函数
 func (s *AuditService) deduplicateVulnerabilities(results []AuditResult) []AuditResult {
 	// 使用 map 来跟踪已见过的漏洞
 	seen := make(map[string]bool)
 	var deduplicated []AuditResult
 
 	for _, vuln := range results {
-		// 生成唯一的 key：漏洞类型 + 文件路径
-		// 对于跨文件分析漏洞，文件路径可能是 "跨文件分析"，需要特殊处理
-		key := generateVulnKey(vuln)
+		// 生成唯一的 key：漏洞类型 + 文件路径 + 位置 + 危险函数（细粒度）
+		key := generateVulnKeyFineGrained(vuln)
 
 		if !seen[key] {
 			seen[key] = true
 			deduplicated = append(deduplicated, vuln)
 		}
-		// 优化：不再打印每个重复漏洞，只在最后打印汇总
 	}
 
 	duplicatedCount := len(results) - len(deduplicated)
 	if duplicatedCount > 0 {
-		// 只在有重复时打印一次汇总，不在高频循环中打印
 		auditLogger.Printf("去重完成: 去除 %d 个重复漏洞，原始 %d 个, 去重后 %d 个",
 			duplicatedCount, len(results), len(deduplicated))
 	}
@@ -998,25 +1026,95 @@ func (s *AuditService) deduplicateVulnerabilities(results []AuditResult) []Audit
 	return deduplicated
 }
 
-// generateVulnKey 生成漏洞唯一标识键
+// generateVulnKey 生成漏洞唯一标识键（简化版，用于兼容）
 func generateVulnKey(vuln AuditResult) string {
-	// 提取漏洞类型（简化）
+	return generateVulnKeyFineGrained(vuln)
+}
+
+// generateVulnKeyFineGrained 生成漏洞唯一标识键（细粒度版）
+// 组合：漏洞类型 + 文件路径 + 代码位置(行号/方法名) + 危险函数
+func generateVulnKeyFineGrained(vuln AuditResult) string {
+	// 提取漏洞类型
 	vulnType := extractVulnerabilityName(vuln.Analysis)
 	if vulnType == "" {
 		vulnType = vuln.Type
 	}
 
-	// 清理文件路径（用于比较）
+	// 清理文件路径
 	filePath := cleanFilePath(vuln.File)
+
+	// 提取代码位置（行号或方法名）
+	location := extractVulnLocation(vuln.Analysis)
+
+	// 提取危险函数
+	dangerousFunc := extractDangerousFunction(vuln.Analysis)
 
 	// 如果是跨文件分析漏洞，使用特殊标记
 	if strings.Contains(filePath, "跨文件") || strings.Contains(vuln.File, "跨文件") {
-		// 跨文件漏洞使用类型 + "跨文件" 作为 key
-		return fmt.Sprintf("%s|跨文件", vulnType)
+		return fmt.Sprintf("%s|跨文件|%s|%s", vulnType, location, dangerousFunc)
 	}
 
-	// 普通漏洞使用类型 + 文件路径
-	return fmt.Sprintf("%s|%s", vulnType, filePath)
+	// 细粒度key: 类型 + 文件 + 位置 + 危险函数
+	return fmt.Sprintf("%s|%s|%s|%s", vulnType, filePath, location, dangerousFunc)
+}
+
+// extractVulnLocation 提取漏洞代码位置
+func extractVulnLocation(analysis string) string {
+	// 尝试提取行号
+	linePatterns := []string{
+		`(\d+)行`,
+		`line[:\s]*(\d+)`,
+		`位于.*?[:：](\d+)`,
+		`:(\d+)`,
+	}
+
+	for _, pattern := range linePatterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(analysis)
+		if len(matches) > 1 {
+			return matches[1]
+		}
+	}
+
+	// 尝试提取方法名
+	methodPatterns := []string{
+		`函数[：:]\s*(\w+)`,
+		`方法[：:]\s*(\w+)`,
+		`在\s+(\w+)\s*\(`,
+	}
+
+	for _, pattern := range methodPatterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(analysis)
+		if len(matches) > 1 {
+			return matches[1]
+		}
+	}
+
+	return "unknown"
+}
+
+// extractDangerousFunction 提取危险函数
+func extractDangerousFunction(analysis string) string {
+	functions := []string{
+		"exec", "Runtime.exec", "ProcessBuilder",
+		"execute", "Statement", "PreparedStatement",
+		"eval", "assert",
+		"ObjectInputStream", "readObject", "deserialize",
+		"FileInputStream", "FileOutputStream", "readFile",
+		"include", "require", "load",
+		"system", "shell_exec", "popen",
+		"query", "cursor.execute", "sql",
+		"subprocess", "os.system",
+		"pickle.load", "yaml.load",
+	}
+
+	for _, fn := range functions {
+		if strings.Contains(analysis, fn) {
+			return fn
+		}
+	}
+	return "unknown"
 }
 
 // ==================== 漏洞复查验证逻辑 ====================
@@ -1204,14 +1302,9 @@ func (s *AuditService) ExecuteAuditWithCrossFileAnalysis(task *AuditTask) error 
 
 	task.Progress = 5
 
-	// 并发分析文件 - 使用goroutine池
+	// 并发分析文件 - 使用goroutine池（动态调整）
 	totalFiles := len(files)
-	concurrentWorkers := 3
-	if totalFiles < 10 {
-		concurrentWorkers = 1
-	} else if totalFiles < 50 {
-		concurrentWorkers = 2
-	}
+	concurrentWorkers := calculateOptimalWorkers(totalFiles)
 
 	s.appendLog(task, fmt.Sprintf("启动 %d 个并发 worker 进行单文件扫描...", concurrentWorkers))
 	updateTaskProgress(task, fmt.Sprintf("启动 %d 个并发 worker 进行单文件扫描...", concurrentWorkers))
@@ -1635,117 +1728,107 @@ func (s *AuditService) AnalyzeCodeWithFileNameAndLanguage(code, filePath, prompt
 }
 
 func getVulnerabilityChecksForLanguage(language string) string {
-	// 用户提供的优化审计提示词
-	auditPrompt := `你是一名资深代码安全审计专家，具备丰富的实战渗透经验和代码审计能力，精通 Java、Go、Python、C/C++ 等主流语言及常见框架（如 Spring、Gin、Django 等）。
-
-【审计目标】
-对提供的代码进行严格安全审计，仅识别"可被直接利用的高危漏洞"，并输出标准化漏洞报告。
-
-【漏洞范围（仅允许以下类型）】
-仅允许报告以下高危且可利用漏洞：
-	•	SQL注入（SQL Injection）
-	•	命令执行 / 命令注入（RCE）
-	•	不安全反序列化
-	•	路径遍历 / 任意文件读写
-	•	硬编码敏感信息（密码 / Token / API Key）
-	•	SSRF（必须可控目标）
-	•	任意文件上传（可导致RCE）
-
-【严格禁止报告（避免误报）】
-禁止报告以下内容：
-	•	XSS（除非明确存在完整利用链）
-	•	CSRF
-	•	信息泄露（如版本号、注释等）
-	•	中低危漏洞
-	•	依赖漏洞（未结合实际利用链）
-	•	仅"可能存在"但无法验证的问题
-
-【严格判定标准（必须全部满足）】
-只有同时满足以下条件才允许报告漏洞：
-	1.	存在明确的用户输入点（如 HTTP 参数、JSON body、文件上传、Header 等）
-	2.	用户输入进入危险函数或敏感操作（如 SQL 执行、系统命令、文件操作等）
-	3.	没有有效安全防护（如未使用参数化查询、无白名单校验、无路径限制等）
-	4.	可以构造真实可执行的攻击 Payload
-
-【关键要求】
-	•	不允许基于猜测或假设报告漏洞
-	•	不确定的漏洞一律忽略
-	•	必须基于真实代码逻辑分析
-	•	必须体现完整数据流（输入 → 处理 → 危险点）
-
-【输出格式（必须严格遵守）】
-漏洞报告
-	•	威胁名称:
-	•	严重等级: Critical / High
-	•	位置: 文件名:行号 或 方法名
-	•	漏洞描述:
-（必须说明数据流：输入 → 处理 → 危险点）
-	•	危险代码:
-	•	利用条件:
-	•	POC / EXP:
-	•	修复建议:
-
-【无漏洞情况】
-如果未发现符合条件的高危漏洞，仅输出：无高危安全漏洞
-不得输出任何其他内容。
-
-【审计重点提示】
-优先分析以下路径：
-	•	Controller → Service → DAO
-	•	用户输入 → SQL拼接
-	•	用户输入 → 命令执行
-	•	用户输入 → 文件路径操作
-	•	用户输入 → 反序列化入口`
+	// 优化版审计提示词 - 强调实战化、可利用、高价值
+	auditPrompt := "You are a senior security expert with 10 years of experience. " +
+		"Your audit style is:宁可漏报,不可误报.\n\n" +
+		"## Core Principle: Practical Vulnerability Criteria\n\n" +
+		"A vulnerability must meet ALL 5 conditions:\n\n" +
+		"1. Clear Attack Entry: HTTP/REST endpoints, file upload, CLI args only\n" +
+		"2. Dangerous Function: SQL exec, command exec, deserialize, file ops\n" +
+		"3. No Protection: No parameterized queries, whitelist, path limits\n" +
+		"4. Constructible Payload: Can construct actual exploit payloads\n" +
+		"5. Practical Value: RCE, database access, credential theft, auth bypass\n\n" +
+		"## Strictly Forbidden (False Positive Zones)\n" +
+		"1. XSS: Only report with complete stored XSS chain proof\n" +
+		"2. CSRF: Frontend issue\n" +
+		"3. Info Disclosure: Version info, paths (unless leads to password leak)\n" +
+		"4. Weak Crypto: Only if protecting critical credentials\n" +
+		"5. URL Redirect: Only if used for phishing\n\n" +
+		"## Output Format for Each Vulnerability\n" +
+		"```\n" +
+		"===VULN_START===\n" +
+		"Threat: [Type-Description]\n" +
+		"Severity: [Critical/High/Medium/Low]\n" +
+		"Location: File=[path] Line=[num] Function=[name]\n" +
+		"DataFlow: Entry->Propagation->DangerPoint\n" +
+		"DangerCode: ```[lang]...\n```\n" +
+		"ExploitCond: Auth required? Privilege level? Complexity?\n" +
+		"Payload: [Specific executable payload]\n" +
+		"Fix: ```[lang]...safe code...\n```\n" +
+		"===VULN_END===\n" +
+		"```\n\n" +
+		"## No Vulnerability Case\n" +
+		"```\n" +
+		"===NO_VULN===\n" +
+		"Code passed strict audit. No directly exploitable high-risk vulnerabilities found.\n" +
+		"Audit criteria: Attack Entry + Dangerous Function + No Protection + Constructible Payload + Practical Value\n" +
+		"===NO_VULN===\n" +
+		"```\n\n" +
+		"## Example: Should Report\n" +
+		"```java\n" +
+		"@PostMapping(\"/login\")\n" +
+		"public User login(@RequestParam String username, @RequestParam String password) {\n" +
+		"    String sql = \"SELECT * FROM users WHERE name='\" + username + \"'\";\n" +
+		"    return jdbcTemplate.queryForObject(sql);\n" +
+		"}\n" +
+		"```\n" +
+		"判定: POST参数 + 字符串拼接SQL + 无参数化 + ' OR '1'='1 -> 报告SQL注入\n\n" +
+		"## Example: Should NOT Report\n" +
+		"```java\n" +
+		"@GetMapping(\"/user/{id}\")\n" +
+		"public User getUser(@PathVariable Long id) {\n" +
+		"    return userRepository.findById(id);\n" +
+		"}\n" +
+		"```\n" +
+		"判定: 使用参数化查询(findById) -> 不报告\n"
 
 	// 语言特定的危险函数映射
 	languageSpecific := map[string]string{
-		"java": "\n### Java 额外检查项（危险函数）" + "\n" +
-			"| 函数/模式 | 漏洞类型 | 判定条件 |" + "\n" +
-			"|:---|:---|:---|" + "\n" +
-			"| Statement.executeQuery(sql) | SQL注入 | sql包含字符串拼接 |" + "\n" +
-			"| Runtime.exec(cmd) | 命令注入 | cmd包含用户输入 |" + "\n" +
-			"| ProcessBuilder | 命令注入 | 命令数组来自用户输入 |" + "\n" +
-			"| ObjectInputStream.readObject() | 反序列化 | 无白名单校验 |" + "\n" +
-			"| FileInputStream/FileReader | 路径遍历 | 路径包含用户输入 |" + "\n" +
-			"| new InitialContext().lookup() | JNDI注入 | lookup参数来自用户输入 |" + "\n" +
-			"| SpEL表达式解析 | SpEL注入 | 无安全上下文配置 |" + "\n" +
-			"| Runtime.getRuntime().exec() | 命令注入 | 命令拼接用户输入 |",
-		"python": "\n### Python 额外检查项（危险函数）" + "\n" +
-			"| 函数/模式 | 漏洞类型 | 判定条件 |" + "\n" +
-			"|:---|:---|:---|" + "\n" +
-			"| execute/cursor.execute(sql) | SQL注入 | sql包含格式化字符串 |" + "\n" +
-			"| os.system/ subprocess.Popen | 命令注入 | 命令来自用户输入 |" + "\n" +
-			"| pickle.loads/ yaml.load | 反序列化 | 使用load非safe_load |" + "\n" +
-			"| eval/ exec | 代码注入 | 执行的代码来自用户输入 |" + "\n" +
-			"| open(filename) | 路径遍历 | 文件名包含用户输入 |" + "\n" +
-			"| render_template_string | SSTI | 使用字符串渲染模板 |" + "\n" +
-			"| requests.get(url) | SSRF | url来自用户输入 |",
-		"go": "\n### Go 额外检查项（危险函数）" + "\n" +
-			"| 函数/模式 | 漏洞类型 | 判定条件 |" + "\n" +
-			"|:---|:---|:---|" + "\n" +
-			"| db.Query(sql) | SQL注入 | sql包含字符串拼接 |" + "\n" +
-			"| exec.Command | 命令注入 | 命令参数来自用户输入 |" + "\n" +
-			"| os.Open/ioutil.ReadFile | 路径遍历 | 路径包含用户输入 |" + "\n" +
-			"| regexp.Compile(用户输入) | ReDoS | 正则来自用户输入 |" + "\n" +
-			"| html/template | 需检查是否安全 | - |",
-		"javascript": "\n### JavaScript/Node.js 额外检查项（危险函数）" + "\n" +
-			"| 函数/模式 | 漏洞类型 | 判定条件 |" + "\n" +
-			"|:---|:---|:---|" + "\n" +
-			"| child_process.exec | 命令注入 | 命令来自用户输入 |" + "\n" +
-			"| eval/ new Function | 代码注入 | 参数来自用户输入 |" + "\n" +
-			"| require(用户输入) | 任意模块加载 | - |" + "\n" +
-			"| JSON.parse(用户输入) | 原型链污染 | 对象合并未过滤__proto__ |" + "\n" +
-			"| fs.readFile/ fs.readFileSync | 路径穿越 | 路径包含用户输入 |" + "\n" +
-			"| axios.get(url)/ fetch(url) | SSRF | url来自用户输入 |",
-		"php": "\n### PHP 额外检查项（危险函数）" + "\n" +
-			"| 函数/模式 | 漏洞类型 | 判定条件 |" + "\n" +
-			"|:---|:---|:---|" + "\n" +
-			"| mysqli_query/execute | SQL注入 | sql包含用户输入拼接 |" + "\n" +
-			"| system/exec/shell_exec/popen | 命令注入 | 命令来自用户输入 |" + "\n" +
-			"| include/require/include_once | 文件包含 | 文件名来自用户输入 |" + "\n" +
-			"| unserialize | 反序列化 | 无签名校验 |" + "\n" +
-			"| file_get_contents/open | 路径遍历 | 路径包含用户输入 |" + "\n" +
-			"| move_uploaded_file | 文件上传 | 未校验文件类型/内容 |",
+		"java": "\n### Java Danger Functions\n" +
+			"| Function | Vuln Type | Condition |\n" +
+			"|:---|:---|:---|\n" +
+			"| Statement.executeQuery(sql) | SQL Injection | String concat |\n" +
+			"| Runtime.exec(cmd) | Command Injection | User input in cmd |\n" +
+			"| ProcessBuilder | Command Injection | Array from user |\n" +
+			"| ObjectInputStream.readObject() | Deserialization | No whitelist |\n" +
+			"| FileInputStream/FileReader | Path Traversal | Path from user |\n" +
+			"| InitialContext().lookup() | JNDI Injection | Param from user |\n" +
+			"| SpEL Expression | SpEL Injection | No safe context |",
+		"python": "\n### Python Danger Functions\n" +
+			"| Function | Vuln Type | Condition |\n" +
+			"|:---|:---|:---|\n" +
+			"| cursor.execute(sql) | SQL Injection | f-string concat |\n" +
+			"| os.system/subprocess.Popen | Command Injection | From user |\n" +
+			"| pickle.loads/yaml.load | Deserialization | Not safe_load |\n" +
+			"| eval/exec | Code Injection | From user |\n" +
+			"| open(filename) | Path Traversal | Filename from user |\n" +
+			"| render_template_string | SSTI | String template |\n" +
+			"| requests.get(url) | SSRF | URL from user |",
+		"go": "\n### Go Danger Functions\n" +
+			"| Function | Vuln Type | Condition |\n" +
+			"|:---|:---|:---|\n" +
+			"| db.Query(sql) | SQL Injection | String concat |\n" +
+			"| exec.Command | Command Injection | Param from user |\n" +
+			"| os.Open/ioutil.ReadFile | Path Traversal | Path from user |\n" +
+			"| regexp.Compile(user) | ReDoS | Regex from user |",
+		"javascript": "\n### JavaScript/Node.js Danger Functions\n" +
+			"| Function | Vuln Type | Condition |\n" +
+			"|:---|:---|:---|\n" +
+			"| child_process.exec | Command Injection | From user |\n" +
+			"| eval/new Function | Code Injection | From user |\n" +
+			"| require(user) | Module Loading | Dynamic require |\n" +
+			"| JSON.parse(user) | Prototype Pollution | No __proto__ filter |\n" +
+			"| fs.readFile | Path Traversal | Path from user |\n" +
+			"| fetch(url)/axios.get(url) | SSRF | URL from user |",
+		"php": "\n### PHP Danger Functions\n" +
+			"| Function | Vuln Type | Condition |\n" +
+			"|:---|:---|:---|\n" +
+			"| mysqli_query/execute | SQL Injection | String concat |\n" +
+			"| system/exec/shell_exec | Command Injection | From user |\n" +
+			"| include/require | File Inclusion | Path from user |\n" +
+			"| unserialize | Deserialization | No signature |\n" +
+			"| file_get_contents/open | Path Traversal | Path from user |\n" +
+			"| move_uploaded_file | File Upload | No type check |",
 	}
 
 	if extra, ok := languageSpecific[language]; ok {
@@ -1996,12 +2079,12 @@ func (s *AuditService) generateCustomReport(results []AuditResult, sourcePath, u
 
 			poc := generatePOC(r, s.client, s.modelName, s.maxTokens, s.temperature)
 			if poc != "" {
+				// POC已经是完整格式（包含代码块），直接输出
 				pocSection.WriteString(fmt.Sprintf("### 漏洞 %d: %s [%s]\n\n", i+1, r.Type, r.Severity))
 				pocSection.WriteString(fmt.Sprintf("文件: %s\n\n", r.File))
 				pocSection.WriteString("**漏洞验证POC**:\n\n")
-				pocSection.WriteString("```\n")
 				pocSection.WriteString(poc)
-				pocSection.WriteString("\n```\n\n")
+				pocSection.WriteString("\n\n")
 			} else {
 				fmt.Printf("[POC生成] 漏洞 %d POC生成失败或返回空\n", i+1)
 			}
@@ -2054,28 +2137,27 @@ func (s *AuditService) formatVulnerabilityEnhanced(index int, r AuditResult, sev
 		severityIcon = "低危"
 	}
 
-	// 漏洞标题
-	b.WriteString(fmt.Sprintf("### %s 漏洞 %d: %s\n\n", severityEmoji, index, vulnName))
+	// ========== 漏洞标题区块 ==========
+	b.WriteString(fmt.Sprintf("### %s [%d] %s\n\n", severityEmoji, index, vulnName))
 
-	// 基本信息卡片
-	b.WriteString("**基本信息**\n\n")
-	b.WriteString("| 属性 | 值 |\n")
-	b.WriteString("|:---|:---|\n")
-	b.WriteString(fmt.Sprintf("| 漏洞类型 | %s |\n", vulnName))
-	b.WriteString(fmt.Sprintf("| 严重程度 | %s %s |\n", severityEmoji, severityIcon))
-	b.WriteString(fmt.Sprintf("| 文件位置 | `%s` |\n", cleanFilePath(r.File)))
+	// ========== 核心信息卡片 ==========
+	b.WriteString("> **⚡ 风险评级**: ")
+	b.WriteString(severityIcon)
+	b.WriteString(" | ")
+	b.WriteString("**📍 位置**: ")
+	b.WriteString(fmt.Sprintf("`%s`", cleanFilePath(r.File)))
+	b.WriteString(" | ")
+	b.WriteString("**🏷️ 类型**: ")
+	b.WriteString(vulnName)
+	b.WriteString("\n\n")
 
-	// CWE编号
-	cwe := extractCWEFromAnalysis(r.Analysis)
-	if cwe != "" {
-		b.WriteString(fmt.Sprintf("| CWE编号 | %s |\n", cwe))
-	}
+	// ========== 漏洞详情区块 ==========
+	b.WriteString("<details>\n")
+	b.WriteString("<summary><b>📋 点击展开漏洞详情</b></summary>\n\n")
 
-	b.WriteString("\n")
-
-	// 危险代码
-	b.WriteString("**危险代码**\n\n")
-	b.WriteString("```java\n")
+	// 1. 危险代码
+	b.WriteString("#### 🔴 危险代码\n\n")
+	b.WriteString("```" + getCodeBlockLang(r.Language) + "\n")
 	codeSnippet := extractCodeSnippetFromAnalysis(r.Analysis)
 	if codeSnippet != "" {
 		b.WriteString(codeSnippet)
@@ -2084,31 +2166,162 @@ func (s *AuditService) formatVulnerabilityEnhanced(index int, r AuditResult, sev
 	}
 	b.WriteString("\n```\n\n")
 
-	// 漏洞描述
-	b.WriteString("**漏洞描述**\n\n")
-	b.WriteString(extractDescriptionFromAnalysis(r.Analysis))
+	// 2. 数据流分析
+	b.WriteString("#### 📊 数据流分析\n\n")
+	dataFlow := extractDataFlowAnalysis(r.Analysis)
+	b.WriteString(dataFlow)
 	b.WriteString("\n\n")
 
-	// 漏洞利用链
-	b.WriteString("**漏洞利用链**\n\n")
-	b.WriteString("```\n")
-	b.WriteString(generateExploitChain(r))
-	b.WriteString("\n```\n\n")
+	// 3. 利用条件
+	b.WriteString("#### 🎯 利用条件\n\n")
+	exploitCond := extractExploitCondition(r.Analysis)
+	b.WriteString(exploitCond)
+	b.WriteString("\n\n")
 
-	// 修复建议
-	b.WriteString("**修复建议**\n\n")
+	// 4. POC/EXP
+	b.WriteString("#### 💀 验证POC\n\n")
+	if r.POC != "" {
+		b.WriteString("```bash\n")
+		b.WriteString(r.POC)
+		b.WriteString("\n```\n\n")
+	} else {
+		b.WriteString("*POC待生成...*\n\n")
+	}
+
+	// 5. 修复建议
+	b.WriteString("#### 🛡️ 修复建议\n\n")
 	fixSuggestion := extractFixSuggestionFromAnalysis(r.Analysis)
 	if fixSuggestion != "" {
-		b.WriteString("```java\n")
+		b.WriteString("```" + getCodeBlockLang(r.Language) + "\n")
 		b.WriteString(fixSuggestion)
 		b.WriteString("\n```\n\n")
 	} else {
-		b.WriteString("暂无修复建议，请参考通用安全编码规范。\n\n")
+		b.WriteString("```" + getCodeBlockLang(r.Language) + "\n")
+		b.WriteString(getDefaultFixSuggestion(vulnName))
+		b.WriteString("\n```\n\n")
 	}
 
+	// 6. CWE/CVE参考
+	cwe := extractCWEFromAnalysis(r.Analysis)
+	if cwe != "" {
+		b.WriteString("#### 📚 参考资料\n\n")
+		b.WriteString(fmt.Sprintf("- **CWE**: [%s](https://cwe.mitre.org/data/definitions/%s.html)\n", cwe, strings.TrimPrefix(cwe, "CWE-")))
+	}
+
+	b.WriteString("</details>\n\n")
 	b.WriteString("---\n\n")
 
 	return b.String()
+}
+
+// getCodeBlockLang 根据语言返回代码块标识
+func getCodeBlockLang(language string) string {
+	langMap := map[string]string{
+		"java":       "java",
+		"python":     "python",
+		"php":        "php",
+		"javascript": "javascript",
+		"typescript": "typescript",
+		"go":         "go",
+		"csharp":     "csharp",
+		"ruby":       "ruby",
+		"swift":      "swift",
+		"kotlin":     "kotlin",
+	}
+	if lang, ok := langMap[language]; ok {
+		return lang
+	}
+	return "java" // 默认
+}
+
+// getDefaultFixSuggestion 根据漏洞类型返回默认修复建议
+func getDefaultFixSuggestion(vulnType string) string {
+	suggestions := map[string]string{
+		"SQL注入": `// ✅ 修复方式：使用参数化查询
+// ❌ 错误示例
+String sql = "SELECT * FROM users WHERE name='" + username + "'";
+
+// ✅ 正确示例
+String sql = "SELECT * FROM users WHERE name=?";
+PreparedStatement pstmt = conn.prepareStatement(sql);
+pstmt.setString(1, username);`,
+		"命令注入": `// ✅ 修复方式：避免使用用户输入执行命令
+// ❌ 错误示例
+Runtime.getRuntime().exec("ls " + userInput);
+
+// ✅ 正确示例：使用白名单验证输入
+if (!userInput.matches("^[a-zA-Z0-9]+$")) {
+    throw new IllegalArgumentException("Invalid input");
+}
+// 或使用数组方式执行命令
+String[] cmd = {"ls", userInput};
+Runtime.getRuntime().exec(cmd);`,
+		"路径遍历": `// ✅ 修复方式：验证路径并使用标准化路径
+// ❌ 错误示例
+File file = new File(baseDir, userInput);
+
+// ✅ 正确示例
+File file = new File(baseDir, userInput);
+String canonicalPath = file.getCanonicalPath();
+if (!canonicalPath.startsWith(baseDir.getCanonicalPath())) {
+    throw new SecurityException("Path traversal detected");
+}`,
+		"不安全的反序列化": `// ✅ 修复方式：避免反序列化不可信数据
+// ❌ 错误示例
+ObjectInputStream ois = new ObjectInputStream(input);
+Object obj = ois.readObject();
+
+// ✅ 正确示例：使用白名单或JSON等安全替代方案
+ObjectMapper mapper = new ObjectMapper();
+MyObject obj = mapper.readValue(jsonString, MyObject.class);`,
+		"硬编码凭据": `// ✅ 修复方式：使用环境变量或密钥管理服务
+// ❌ 错误示例
+private static final String API_KEY = "sk-xxxx";
+
+// ✅ 正确示例
+private static final String API_KEY = System.getenv("API_KEY");
+// 或使用AWS Secrets Manager、HashiCorp Vault等`,
+	}
+	if suggestion, ok := suggestions[vulnType]; ok {
+		return suggestion
+	}
+	return "// 请根据具体漏洞类型进行修复\n// 1. 输入验证\n// 2. 参数化查询\n// 3. 最小权限原则"
+}
+
+// extractDataFlowAnalysis 提取数据流分析
+func extractDataFlowAnalysis(analysis string) string {
+	// 尝试提取数据流信息
+	patterns := []string{
+		`数据流[：:]\s*([\s\S]{50,500})`,
+		`入口点[：:]\s*([\s\S]{30,300})`,
+		`传播路径[：:]\s*([\s\S]{30,300})`,
+	}
+	for _, pattern := range patterns {
+		re := regexp.MustCompile(pattern)
+		matches := re.FindStringSubmatch(analysis)
+		if len(matches) > 1 {
+			return strings.TrimSpace(matches[1])
+		}
+	}
+	// 默认返回
+	return "**输入点**: 用户输入 → **处理过程**: 未做校验 → **危险点**: 进入危险函数"
+}
+
+// extractExploitCondition 提取利用条件
+func extractExploitCondition(analysis string) string {
+	// 尝试提取利用条件
+	pattern := regexp.MustCompile(`利用条件[：:]\s*([\s\S]{30,300})`)
+	matches := pattern.FindStringSubmatch(analysis)
+	if len(matches) > 1 {
+		return strings.TrimSpace(matches[1])
+	}
+	// 返回通用条件
+	return `| 条件 | 说明 |
+|:---|:---|
+| 认证要求 | 部分漏洞需要登录权限 |
+| 利用复杂度 | 中（需要构造特定Payload）|
+| 影响范围 | 可导致数据泄露/服务器权限丢失 |
+| 利用方式 | 通过HTTP请求发送恶意Payload |`
 }
 
 // formatVulnerabilitySimple 简化版漏洞格式化 - 优化排版
@@ -2240,20 +2453,34 @@ func generatePOC(r AuditResult, client *openai.Client, modelName string, maxToke
 	// 提取行号信息
 	lineNum := extractLineNumber(r.Analysis)
 
-	// 调用AI生成POC - 简化提示词，提高成功率
+	// 调用AI生成POC - 优化提示词，生成标准格式POC
 	prompt := "请为以下漏洞生成可执行的验证POC。\n\n" +
 		"## 漏洞基本信息\n" +
 		"- **漏洞类型**: " + vulnType + "\n" +
 		"- **严重等级**: " + severity + "\n" +
 		"- **文件位置**: " + r.File + "\n" +
 		"- **代码行号**: " + lineNum + "\n\n" +
-		"## 漏洞代码片段\n```\n" + codeSnippet + "\n```\n\n" +
-		"## AI分析详情\n" + r.Analysis + "\n\n" +
-		"## POC要求\n" +
-		"1. 生成可直接执行的curl或Python脚本\n" +
-		"2. 包含具体的攻击Payload\n" +
-		"3. 说明预期的响应结果\n" +
-		"4. 如果无法生成POC，返回\"无法生成POC\""
+		"## 漏洞代码片段\n" +
+		"```\n" + codeSnippet + "\n```\n\n" +
+		"## AI分析详情\n" +
+		r.Analysis + "\n\n" +
+		"## POC生成要求（必须严格遵守）\n\n" +
+		"### 输出格式要求\n" +
+		"必须使用标准格式输出POC，包含以下部分：\n\n" +
+		"1. curl命令POC（使用bash代码块）\n" +
+		"2. Python脚本POC（使用python代码块）\n" +
+		"3. 预期响应结果\n" +
+		"4. 注意事项\n\n" +
+		"### 特殊漏洞处理\n" +
+		"- SQL注入: 提供具体注入payload（如 ' OR '1'='1, UNION SELECT等）\n" +
+		"- 硬编码Token: 提供具体Token值，说明如何利用\n" +
+		"- 命令注入: 提供具体命令payload（如 ; whoami, $(whoami)等）\n" +
+		"- 路径遍历: 提供穿越路径payload（如 ../../../etc/passwd）\n\n" +
+		"### 关键要求\n" +
+		"- POC必须可直接执行\n" +
+		"- 必须包含具体的攻击Payload\n" +
+		"- 保持输出简洁，不要添加额外解释\n\n" +
+		"请严格按照上述格式生成POC。"
 
 	resp, err := client.CreateChatCompletion(
 		context.Background(),
@@ -2956,4 +3183,1085 @@ func (s *AuditService) CreateSandbox(taskID string) (string, error) {
 func (s *AuditService) CleanupSandbox(taskID string) error {
 	sandboxDir := filepath.Join(".", "sandbox", "audit-sandbox", taskID)
 	return os.RemoveAll(sandboxDir)
+}
+
+// ==================== Worker动态调整功能 ====================
+
+// ServerMetrics 服务器性能监控
+type ServerMetrics struct {
+	CPUPercent       float64   // CPU使用率 (0-100)
+	MemoryUsedGB     float64   // 已使用内存 (GB)
+	MemoryTotalGB    float64   // 总内存 (GB)
+	MemoryFreeGB     float64   // 可用内存 (GB)
+	AvailableWorkers int32     // 可用worker数量
+	LoadAverage      float64   // 系统负载 (Linux)
+	LastUpdate       time.Time // 最后更新时间
+	mu               sync.RWMutex
+}
+
+// GlobalServerMetrics 全局服务器性能监控实例
+var GlobalServerMetrics = &ServerMetrics{
+	LastUpdate: time.Now(),
+}
+
+// GetCurrentMetrics 获取当前服务器性能指标
+func (s *ServerMetrics) GetCurrentMetrics() {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+
+	// 获取CPU使用率
+	cpuPercent, err := cpu.Percent(time.Second, false)
+	if err == nil && len(cpuPercent) > 0 {
+		s.CPUPercent = cpuPercent[0]
+	}
+
+	// 获取内存信息
+	memInfo, err := mem.VirtualMemory()
+	if err == nil {
+		s.MemoryTotalGB = float64(memInfo.Total) / (1024 * 1024 * 1024)
+		s.MemoryUsedGB = float64(memInfo.Used) / (1024 * 1024 * 1024)
+		s.MemoryFreeGB = float64(memInfo.Available) / (1024 * 1024 * 1024)
+	}
+
+	s.LastUpdate = time.Now()
+}
+
+// GetAvailableMemoryPercent 获取可用内存百分比
+func (s *ServerMetrics) GetAvailableMemoryPercent() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	if s.MemoryTotalGB > 0 {
+		return (s.MemoryFreeGB / s.MemoryTotalGB) * 100
+	}
+	return 50.0 // 默认值
+}
+
+// GetCPUUsageLevel 获取CPU使用级别 (0-100 -> 0.0-1.0)
+func (s *ServerMetrics) GetCPUUsageLevel() float64 {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	return s.CPUPercent / 100.0
+}
+
+// DynamicWorkerPool 动态Worker池
+type DynamicWorkerPool struct {
+	minWorkers     int32             // 最小worker数
+	maxWorkers     int32             // 最大worker数
+	currentWorkers int32             // 当前worker数
+	activeWorkers  int32             // 活跃worker数
+	metrics        *ServerMetrics    // 服务器性能监控
+	fileQueue      chan string       // 文件队列
+	resultQueue    chan *AuditResult // 结果队列
+	totalFiles     int               // 总文件数
+	processedFiles int32             // 已处理文件数
+	mu             sync.RWMutex      // 互斥锁
+	stopCh         chan struct{}     // 停止信号
+	adjustTicker   *time.Ticker      // 调整定时器
+	adjustInterval time.Duration     // 调整间隔
+	isRunning      bool              // 是否运行中
+}
+
+// NewDynamicWorkerPool 创建动态Worker池
+func NewDynamicWorkerPool(minWorkers, maxWorkers int) *DynamicWorkerPool {
+	if minWorkers < 1 {
+		minWorkers = 1
+	}
+	if maxWorkers > 32 {
+		maxWorkers = 32 // 最多32个worker
+	}
+	if maxWorkers < minWorkers {
+		maxWorkers = minWorkers
+	}
+
+	pool := &DynamicWorkerPool{
+		minWorkers:     int32(minWorkers),
+		maxWorkers:     int32(maxWorkers),
+		currentWorkers: int32(minWorkers),
+		activeWorkers:  0,
+		metrics:        GlobalServerMetrics,
+		fileQueue:      make(chan string, 1000),
+		resultQueue:    make(chan *AuditResult, 1000),
+		stopCh:         make(chan struct{}),
+		adjustInterval: 5 * time.Second, // 每5秒调整一次
+	}
+
+	return pool
+}
+
+// StartWithFiles 开始处理文件
+func (p *DynamicWorkerPool) StartWithFiles(files []string, totalFiles int, processFunc func(file string, workerID int) *AuditResult) {
+	p.mu.Lock()
+	if p.isRunning {
+		p.mu.Unlock()
+		return
+	}
+	p.isRunning = true
+	p.totalFiles = totalFiles
+	p.processedFiles = 0
+	p.stopCh = make(chan struct{})
+	p.mu.Unlock()
+
+	// 启动性能监控
+	go p.monitorPerformance()
+
+	// 启动动态调整
+	go p.dynamicAdjust()
+
+	// 启动worker池
+	for i := int32(0); i < p.currentWorkers; i++ {
+		go p.worker(i, processFunc)
+	}
+
+	// 发送文件到队列
+	go func() {
+		for _, file := range files {
+			select {
+			case p.fileQueue <- file:
+			case <-p.stopCh:
+				return
+			}
+		}
+		// 关闭文件队列
+		close(p.fileQueue)
+	}()
+}
+
+// worker Worker处理函数
+func (p *DynamicWorkerPool) worker(workerID int32, processFunc func(file string, workerID int) *AuditResult) {
+	atomic.AddInt32(&p.activeWorkers, 1)
+	defer atomic.AddInt32(&p.activeWorkers, -1)
+
+	for file := range p.fileQueue {
+		select {
+		case <-p.stopCh:
+			return
+		default:
+			// 处理文件
+			result := processFunc(file, int(workerID))
+			if result != nil {
+				select {
+				case p.resultQueue <- result:
+				case <-p.stopCh:
+					return
+				}
+			}
+			atomic.AddInt32(&p.processedFiles, 1)
+		}
+	}
+}
+
+// monitorPerformance 监控服务器性能
+func (p *DynamicWorkerPool) monitorPerformance() {
+	ticker := time.NewTicker(2 * time.Second)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			// 更新性能指标
+			p.metrics.GetCurrentMetrics()
+		}
+	}
+}
+
+// dynamicAdjust 动态调整worker数量
+func (p *DynamicWorkerPool) dynamicAdjust() {
+	ticker := time.NewTicker(p.adjustInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-p.stopCh:
+			return
+		case <-ticker.C:
+			p.adjustWorkers()
+		}
+	}
+}
+
+// adjustWorkers 根据性能指标调整worker数量
+func (p *DynamicWorkerPool) adjustWorkers() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	metrics := p.metrics
+	metrics.GetCurrentMetrics()
+
+	// 获取当前状态
+	currentWorkers := p.currentWorkers
+	availableMemory := metrics.GetAvailableMemoryPercent()
+	cpuUsage := metrics.GetCPUUsageLevel()
+
+	// 计算目标worker数
+	var targetWorkers int32
+
+	// 策略1: 如果CPU和内存都充足，优先满worker
+	if cpuUsage < 0.5 && availableMemory > 50 {
+		// 性能充足，增加worker
+		targetWorkers = currentWorkers + 1
+		auditLogger.Printf("[动态Worker] 性能充足，增加worker: %d -> %d (CPU: %.1f%%, 内存可用: %.1f%%)",
+			currentWorkers, targetWorkers, metrics.CPUPercent, availableMemory)
+	} else if cpuUsage > 0.85 || availableMemory < 20 {
+		// 性能不足，减少worker
+		targetWorkers = currentWorkers - 1
+		auditLogger.Printf("[动态Worker] 性能不足，减少worker: %d -> %d (CPU: %.1f%%, 内存可用: %.1f%%)",
+			currentWorkers, targetWorkers, metrics.CPUPercent, availableMemory)
+	} else {
+		// 性能适中，保持不变
+		targetWorkers = currentWorkers
+	}
+
+	// 确保在范围内
+	if targetWorkers < p.minWorkers {
+		targetWorkers = p.minWorkers
+	}
+	if targetWorkers > p.maxWorkers {
+		targetWorkers = p.maxWorkers
+	}
+
+	// 如果目标worker数改变
+	if targetWorkers != currentWorkers {
+		p.currentWorkers = targetWorkers
+
+		// 如果需要增加worker，启动新的worker
+		if targetWorkers > currentWorkers {
+			diff := targetWorkers - currentWorkers
+			for i := int32(0); i < diff; i++ {
+				go p.worker(currentWorkers+i, nil) // 将在下次循环中使用新的processFunc
+			}
+		}
+		// 如果需要减少worker，通过减少文件处理来间接减少
+		// (活跃的worker会自然完成并退出)
+	}
+}
+
+// GetResults 获取所有结果
+func (p *DynamicWorkerPool) GetResults() []*AuditResult {
+	var results []*AuditResult
+
+	p.mu.RLock()
+	total := p.totalFiles
+	p.mu.RUnlock()
+
+	timeout := time.After(30 * time.Minute) // 超时30分钟
+
+	for len(results) < int(atomic.LoadInt32(&p.processedFiles)) || !p.isQueueClosed() {
+		select {
+		case result, ok := <-p.resultQueue:
+			if !ok {
+				return results
+			}
+			results = append(results, result)
+		case <-timeout:
+			auditLogger.Printf("[动态Worker] 获取结果超时，已获取 %d 个结果", len(results))
+			return results
+		case <-p.stopCh:
+			return results
+		default:
+			// 检查是否所有文件都已处理
+			if atomic.LoadInt32(&p.processedFiles) >= int32(total) {
+				// 关闭结果队列
+				close(p.resultQueue)
+			}
+			time.Sleep(100 * time.Millisecond)
+		}
+	}
+
+	return results
+}
+
+// isQueueClosed 检查文件队列是否已关闭
+func (p *DynamicWorkerPool) isQueueClosed() bool {
+	select {
+	case _, ok := <-p.fileQueue:
+		if ok {
+			// 重新放回
+			go func() { p.fileQueue <- "" }()
+		}
+		return !ok
+	default:
+		return false
+	}
+}
+
+// Stop 停止Worker池
+func (p *DynamicWorkerPool) Stop() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if !p.isRunning {
+		return
+	}
+
+	p.isRunning = false
+	close(p.stopCh)
+
+	// 关闭所有channel
+	close(p.resultQueue)
+}
+
+// GetProgress 获取处理进度
+func (p *DynamicWorkerPool) GetProgress() (processed, total int) {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return int(atomic.LoadInt32(&p.processedFiles)), p.totalFiles
+}
+
+// GetCurrentWorkers 获取当前worker数量
+func (p *DynamicWorkerPool) GetCurrentWorkers() int32 {
+	p.mu.RLock()
+	defer p.mu.RUnlock()
+	return p.currentWorkers
+}
+
+// GetMetrics 获取性能指标
+func (p *DynamicWorkerPool) GetMetrics() *ServerMetrics {
+	p.metrics.GetCurrentMetrics()
+	return p.metrics
+}
+
+// calculateOptimalWorkers 根据服务器性能和文件数量动态计算最佳worker数量（增强版）
+func calculateOptimalWorkers(totalFiles int) int {
+	// 优先满worker：获取服务器实际性能
+	metrics := GlobalServerMetrics
+	metrics.GetCurrentMetrics()
+
+	// 获取CPU核心数
+	numCPU := runtime.NumCPU()
+
+	// 获取内存信息
+	memInfo, err := mem.VirtualMemory()
+	var totalMemoryGB, availableMemoryGB float64
+	if err == nil {
+		totalMemoryGB = float64(memInfo.Total) / (1024 * 1024 * 1024)
+		availableMemoryGB = float64(memInfo.Available) / (1024 * 1024 * 1024)
+	} else {
+		// 回退到runtime.MemStats
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		totalMemoryGB = float64(memStats.Sys) / (1024 * 1024 * 1024)
+		availableMemoryGB = totalMemoryGB * 0.3 // 估算
+	}
+
+	// 根据文件数量确定基础worker数（优先满worker）
+	baseWorkers := numCPU
+	if baseWorkers > 24 {
+		baseWorkers = 24 // 最多24个worker（高性能服务器）
+	}
+	if baseWorkers < 2 {
+		baseWorkers = 2 // 最少2个worker
+	}
+
+	// 根据文件数量调整
+	if totalFiles < 10 {
+		baseWorkers = 2
+	} else if totalFiles < 50 {
+		baseWorkers = min(4, baseWorkers)
+	} else if totalFiles < 100 {
+		baseWorkers = min(6, baseWorkers)
+	} else if totalFiles < 200 {
+		baseWorkers = min(8, baseWorkers)
+	} else if totalFiles < 500 {
+		baseWorkers = min(12, baseWorkers)
+	} else {
+		baseWorkers = min(16, baseWorkers)
+	}
+
+	// 性能调整因子
+	cpuUsage := metrics.GetCPUUsageLevel()
+	memoryAvailablePercent := (availableMemoryGB / totalMemoryGB) * 100
+
+	// 动态调整
+	performanceScore := (1.0-cpuUsage)*0.5 + (memoryAvailablePercent/100.0)*0.5
+
+	// 根据性能分数调整
+	var optimalWorkers int
+	if performanceScore >= 0.8 {
+		// 性能充足，优先满worker，使用更高的worker数
+		optimalWorkers = baseWorkers
+		auditLogger.Printf("[动态Worker] 性能充足，启用满worker模式: %d workers (CPU: %.1f%%, 内存可用: %.1f%%)",
+			optimalWorkers, metrics.CPUPercent, memoryAvailablePercent)
+	} else if performanceScore >= 0.5 {
+		// 性能适中，使用适中的worker数
+		optimalWorkers = baseWorkers / 2
+		if optimalWorkers < 2 {
+			optimalWorkers = 2
+		}
+		auditLogger.Printf("[动态Worker] 性能适中，平衡模式: %d workers (CPU: %.1f%%, 内存可用: %.1f%%)",
+			optimalWorkers, metrics.CPUPercent, memoryAvailablePercent)
+	} else {
+		// 性能不足，降低worker数
+		optimalWorkers = baseWorkers / 4
+		if optimalWorkers < 1 {
+			optimalWorkers = 1
+		}
+		auditLogger.Printf("[动态Worker] 性能不足，节能模式: %d workers (CPU: %.1f%%, 内存可用: %.1f%%)",
+			optimalWorkers, metrics.CPUPercent, memoryAvailablePercent)
+	}
+
+	// 内存限制检查
+	maxWorkersByMem := int(availableMemoryGB * 2) // 每GB可用内存支持约2个worker
+	if maxWorkersByMem < 1 {
+		maxWorkersByMem = 1
+	}
+
+	// 取两者的最小值
+	optimalWorkers = min(optimalWorkers, maxWorkersByMem)
+
+	// 确保至少1个worker
+	if optimalWorkers < 1 {
+		optimalWorkers = 1
+	}
+
+	auditLogger.Printf("[动态Worker] 最终worker数=%d (CPU=%d核, 内存=%.1fGB/%.1fGB, 文件数=%d, 性能分数=%.2f)",
+		optimalWorkers, numCPU, availableMemoryGB, totalMemoryGB, totalFiles, performanceScore)
+
+	return optimalWorkers
+}
+
+// calculateMaxWorkersForServer 根据服务器配置计算最大worker数
+func calculateMaxWorkersForServer() int {
+	// 获取CPU核心数
+	numCPU := runtime.NumCPU()
+
+	// 获取内存信息
+	memInfo, err := mem.VirtualMemory()
+	var totalMemoryGB float64
+	if err == nil {
+		totalMemoryGB = float64(memInfo.Total) / (1024 * 1024 * 1024)
+	} else {
+		var memStats runtime.MemStats
+		runtime.ReadMemStats(&memStats)
+		totalMemoryGB = float64(memStats.Sys) / (1024 * 1024 * 1024)
+	}
+
+	// 计算最大worker数：取CPU和内存支持的最大值
+	// CPU: 每核心支持1-2个worker
+	// 内存: 每GB支持约2个worker
+	maxByCPU := numCPU * 2
+	maxByMem := int(totalMemoryGB * 2)
+
+	maxWorkers := min(maxByCPU, maxByMem)
+
+	// 设置上限
+	if maxWorkers > 32 {
+		maxWorkers = 32
+	}
+	if maxWorkers < 2 {
+		maxWorkers = 2
+	}
+
+	return maxWorkers
+}
+
+// ==================== 新增功能 ====================
+
+// AnalyzeProjectStructure 分析项目结构，返回详细的文件分类和优先级
+func (s *AuditService) AnalyzeProjectStructure(rootPath string) (*ProjectStructure, error) {
+	structure := &ProjectStructure{
+		RootPath:        rootPath,
+		Files:           []FileInfo{},
+		BusinessFiles:   []FileInfo{},
+		TestFiles:       []FileInfo{},
+		ConfigFiles:     []FileInfo{},
+		DependencyFiles: []FileInfo{},
+		BuildArtifacts:  []FileInfo{},
+		SkippedFiles:    []FileInfo{},
+		FileTypeStats:   make(map[string]int),
+	}
+
+	var totalSize int64
+
+	err := filepath.Walk(rootPath, func(path string, info os.FileInfo, err error) error {
+		if err != nil {
+			return err
+		}
+
+		relPath, _ := filepath.Rel(rootPath, path)
+		ext := strings.ToLower(filepath.Ext(path))
+
+		// 判断是否为目录
+		if info.IsDir() {
+			structure.TotalDirs++
+			return nil
+		}
+
+		structure.TotalFiles++
+		totalSize += info.Size()
+
+		// 创建文件信息
+		fileInfo := FileInfo{
+			Path:        relPath,
+			IsDir:       false,
+			Size:        info.Size(),
+			Extension:   ext,
+			Priority:    5, // 默认优先级
+			Category:    "unknown",
+			ShouldAudit: true,
+		}
+
+		// 分类和设置优先级
+		category, priority, shouldAudit, skipReason := classifyFile(relPath, ext, info)
+		fileInfo.Category = category
+		fileInfo.Priority = priority
+		fileInfo.ShouldAudit = shouldAudit
+		fileInfo.SkipReason = skipReason
+
+		// 设置编程语言
+		fileInfo.Language = getLanguageFromExt(ext)
+
+		// 统计文件类型
+		structure.FileTypeStats[ext]++
+
+		// 根据分类添加到对应列表
+		switch category {
+		case "business":
+			structure.BusinessFiles = append(structure.BusinessFiles, fileInfo)
+		case "test":
+			structure.TestFiles = append(structure.TestFiles, fileInfo)
+		case "config":
+			structure.ConfigFiles = append(structure.ConfigFiles, fileInfo)
+		case "dependency":
+			structure.DependencyFiles = append(structure.DependencyFiles, fileInfo)
+		case "build":
+			structure.BuildArtifacts = append(structure.BuildArtifacts, fileInfo)
+		case "skip":
+			structure.SkippedFiles = append(structure.SkippedFiles, fileInfo)
+		}
+
+		if shouldAudit {
+			structure.Files = append(structure.Files, fileInfo)
+		}
+
+		return nil
+	})
+
+	if err != nil {
+		return nil, fmt.Errorf("分析项目结构失败: %v", err)
+	}
+
+	structure.TotalSize = totalSize
+
+	// 按优先级排序（高优先级在前）
+	sortFilesByPriority(structure.BusinessFiles)
+	sortFilesByPriority(structure.TestFiles)
+
+	return structure, nil
+}
+
+// classifyFile 分类文件并确定优先级
+func classifyFile(relPath, ext string, info os.FileInfo) (category string, priority int, shouldAudit bool, skipReason string) {
+	// 构建产物 - 不审计
+	buildPatterns := []string{
+		"target/", "build/", "dist/", ".next/", ".nuxt/",
+		"out/", "bin/", "obj/", ".gradle/", ".mvn/",
+		"node_modules/", "bower_components/", "vendor/",
+		"__pycache__/", ".pytest_cache/", ".tox/",
+	}
+	for _, pattern := range buildPatterns {
+		if strings.Contains(relPath, pattern) {
+			return "build", 0, false, "构建产物"
+		}
+	}
+
+	// 依赖文件 - 低优先级
+	depPatterns := []string{
+		".min.js", ".min.css", ".bundle.js", ".bundle.css",
+		"package-lock.json", "yarn.lock", "package.json",
+		"pom.xml", "build.gradle", "requirements.txt",
+		"go.mod", "go.sum", "Cargo.lock",
+	}
+	for _, pattern := range depPatterns {
+		if strings.Contains(relPath, pattern) {
+			return "dependency", 1, false, "依赖配置文件"
+		}
+	}
+
+	// 二进制文件 - 不审计
+	binaryExts := []string{
+		".exe", ".dll", ".so", ".dylib", ".a", ".o",
+		".class", ".pyc", ".pyo", ".jar", ".war",
+		".png", ".jpg", ".jpeg", ".gif", ".bmp", ".ico",
+		".mp3", ".mp4", ".avi", ".mov", ".wav",
+		".pdf", ".doc", ".docx", ".xls", ".xlsx",
+		".zip", ".tar", ".gz", ".rar", ".7z",
+		".ttf", ".otf", ".woff", ".woff2", ".eot",
+	}
+	for _, binaryExt := range binaryExts {
+		if ext == binaryExt {
+			return "skip", 0, false, "二进制/资源文件"
+		}
+	}
+
+	// 测试文件 - 中等优先级
+	testPatterns := []string{
+		"/test/", "/tests/", "/spec/", "/specs/",
+		"_test.go", "_test.py", ".test.js", ".test.ts",
+		".spec.js", ".spec.ts", "Test.java", "Tests.java",
+	}
+	for _, pattern := range testPatterns {
+		if strings.Contains(relPath, pattern) {
+			return "test", 5, true, ""
+		}
+	}
+
+	// 配置文件 - 低优先级
+	configPatterns := []string{
+		".yml", ".yaml", ".json", ".xml", ".toml",
+		".ini", ".conf", ".config", ".properties",
+		".env", ".gitignore", ".dockerignore",
+	}
+	for _, pattern := range configPatterns {
+		if ext == pattern || strings.HasSuffix(relPath, pattern) {
+			return "config", 2, true, ""
+		}
+	}
+
+	// 脚本文件
+	scriptExts := []string{".sh", ".bash", ".zsh", ".ps1", ".bat", ".cmd"}
+	for _, scriptExt := range scriptExts {
+		if ext == scriptExt {
+			return "business", 6, true, "" // 脚本通常很重要
+		}
+	}
+
+	// 业务代码 - 高优先级
+	businessExts := []string{
+		".java", ".php", ".py", ".js", ".ts", ".jsx", ".tsx",
+		".go", ".cs", ".rb", ".swift", ".kt", ".scala",
+		".rs", ".dart", ".groovy", ".c", ".cpp", ".h", ".hpp",
+		".vue", ".svelte", ".jsx",
+	}
+	for _, businessExt := range businessExts {
+		if ext == businessExt {
+			// 根据文件大小调整优先级
+			priority := 8
+			if info.Size() > 100*1024 { // > 100KB
+				priority = 7 // 太大可能不是核心逻辑
+			} else if info.Size() < 1024 { // < 1KB
+				priority = 6 // 太小的文件可能不重要
+			}
+			return "business", priority, true, ""
+		}
+	}
+
+	// 默认
+	return "skip", 0, false, "非代码文件"
+}
+
+// sortFilesByPriority 按优先级降序排序
+func sortFilesByPriority(files []FileInfo) {
+	for i := 0; i < len(files)-1; i++ {
+		for j := i + 1; j < len(files); j++ {
+			if files[j].Priority > files[i].Priority {
+				files[i], files[j] = files[j], files[i]
+			}
+		}
+	}
+}
+
+// getLanguageFromExt 根据扩展名获取编程语言
+func getLanguageFromExt(ext string) string {
+	langMap := map[string]string{
+		".java": "Java", ".kt": "Kotlin", ".scala": "Scala",
+		".py": "Python", ".js": "JavaScript", ".ts": "TypeScript",
+		".jsx": "React", ".tsx": "React", ".vue": "Vue",
+		".go": "Go", ".cs": "C#", ".rb": "Ruby",
+		".swift": "Swift", ".rs": "Rust", ".php": "PHP",
+		".c": "C", ".cpp": "C++", ".h": "C/C++",
+		".dart": "Dart", ".groovy": "Groovy",
+	}
+	if lang, ok := langMap[ext]; ok {
+		return lang
+	}
+	return "Unknown"
+}
+
+// GetAuditFiles 获取应该审计的文件列表（按优先级排序）
+func (s *AuditService) GetAuditFiles(rootPath string, selectedPaths []string) ([]string, error) {
+	structure, err := s.AnalyzeProjectStructure(rootPath)
+	if err != nil {
+		return nil, err
+	}
+
+	// 如果用户选择了特定路径，只审计选中的
+	if len(selectedPaths) > 0 {
+		var selectedFiles []string
+		for _, selected := range selectedPaths {
+			fullPath := filepath.Join(rootPath, selected)
+			if info, err := os.Stat(fullPath); err == nil && !info.IsDir() {
+				selectedFiles = append(selectedFiles, fullPath)
+			}
+		}
+		return selectedFiles, nil
+	}
+
+	// 按优先级返回所有应审计的文件
+	var auditFiles []string
+	for _, f := range structure.BusinessFiles {
+		if f.ShouldAudit {
+			auditFiles = append(auditFiles, filepath.Join(rootPath, f.Path))
+		}
+	}
+	for _, f := range structure.TestFiles {
+		if f.ShouldAudit {
+			auditFiles = append(auditFiles, filepath.Join(rootPath, f.Path))
+		}
+	}
+	for _, f := range structure.ConfigFiles {
+		if f.ShouldAudit {
+			auditFiles = append(auditFiles, filepath.Join(rootPath, f.Path))
+		}
+	}
+
+	return auditFiles, nil
+}
+
+// ==================== 增量分析功能 ====================
+
+// globalHashStore 全局文件哈希存储
+var globalHashStore = &FileHashStore{
+	hashes: make(map[string]string),
+}
+
+// CalculateFileHash 计算文件哈希
+func (s *AuditService) CalculateFileHash(filePath string) (string, error) {
+	content, err := os.ReadFile(filePath)
+	if err != nil {
+		return "", err
+	}
+	hash := fnv64a(content)
+	return fmt.Sprintf("%x", hash), nil
+}
+
+// GetChangedFiles 获取变更的文件列表
+func (s *AuditService) GetChangedFiles(rootPath string, previousHashes map[string]string) ([]string, []string, error) {
+	structure, err := s.AnalyzeProjectStructure(rootPath)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var changedFiles []string
+	var newFiles []string
+
+	for _, f := range structure.Files {
+		fullPath := filepath.Join(rootPath, f.Path)
+		currentHash, err := s.CalculateFileHash(fullPath)
+		if err != nil {
+			continue
+		}
+
+		prevHash, existed := previousHashes[f.Path]
+		if !existed {
+			// 新文件
+			newFiles = append(newFiles, fullPath)
+		} else if prevHash != currentHash {
+			// 变更的文件
+			changedFiles = append(changedFiles, fullPath)
+		}
+	}
+
+	return changedFiles, newFiles, nil
+}
+
+// GetUnchangedFiles 获取未变更的文件列表
+func (s *AuditService) GetUnchangedFiles(rootPath string, previousHashes map[string]string) ([]string, error) {
+	structure, err := s.AnalyzeProjectStructure(rootPath)
+	if err != nil {
+		return nil, err
+	}
+
+	var unchangedFiles []string
+
+	for _, f := range structure.Files {
+		fullPath := filepath.Join(rootPath, f.Path)
+		currentHash, err := s.CalculateFileHash(fullPath)
+		if err != nil {
+			continue
+		}
+
+		prevHash, existed := previousHashes[f.Path]
+		if existed && prevHash == currentHash {
+			unchangedFiles = append(unchangedFiles, fullPath)
+		}
+	}
+
+	return unchangedFiles, nil
+}
+
+// StoreFileHashes 存储文件哈希
+func (s *AuditService) StoreFileHashes(rootPath string) (map[string]string, error) {
+	structure, err := s.AnalyzeProjectStructure(rootPath)
+	if err != nil {
+		return nil, err
+	}
+
+	hashes := make(map[string]string)
+	for _, f := range structure.Files {
+		fullPath := filepath.Join(rootPath, f.Path)
+		hash, err := s.CalculateFileHash(fullPath)
+		if err != nil {
+			continue
+		}
+		hashes[f.Path] = hash
+	}
+
+	return hashes, nil
+}
+
+// ==================== POC批量生成功能 ====================
+
+// POCBatchRequest POC批量生成请求
+type POCBatchRequest struct {
+	Vulnerabilities []AuditResult `json:"vulnerabilities"`
+	BatchSize       int           `json:"batchSize"`  // 每批处理的漏洞数
+	MaxRetries      int           `json:"maxRetries"` // 最大重试次数
+}
+
+// POCBatchResult POC批量生成结果
+type POCBatchResult struct {
+	TotalCount    int                   `json:"totalCount"`
+	SuccessCount  int                   `json:"successCount"`
+	FailedCount   int                   `json:"failedCount"`
+	Results       []POCGenerationResult `json:"results"`
+	TotalDuration time.Duration         `json:"totalDuration"`
+}
+
+// POCGenerationResult 单个POC生成结果
+type POCGenerationResult struct {
+	Index        int    `json:"index"`
+	VulnType     string `json:"vulnType"`
+	FilePath     string `json:"filePath"`
+	POC          string `json:"poc"`
+	Success      bool   `json:"success"`
+	ErrorMessage string `json:"errorMessage,omitempty"`
+}
+
+// BatchGeneratePOC 批量生成POC（并发优化版）
+func (s *AuditService) BatchGeneratePOC(req POCBatchRequest) POCBatchResult {
+	startTime := time.Now()
+	result := POCBatchResult{
+		TotalCount:    len(req.Vulnerabilities),
+		Results:       make([]POCGenerationResult, len(req.Vulnerabilities)),
+		TotalDuration: 0,
+	}
+
+	if req.BatchSize <= 0 {
+		req.BatchSize = 3 // 默认每批3个
+	}
+	if req.MaxRetries <= 0 {
+		req.MaxRetries = 2
+	}
+
+	// 使用信号量控制并发数
+	sem := make(chan struct{}, req.BatchSize)
+	var wg sync.WaitGroup
+	var mu sync.Mutex
+
+	for i, vuln := range req.Vulnerabilities {
+		wg.Add(1)
+		go func(index int, v AuditResult) {
+			defer wg.Done()
+
+			// 获取信号量
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			pocResult := POCGenerationResult{
+				Index:    index,
+				VulnType: extractVulnTypeFromAnalysis(v.Analysis),
+				FilePath: v.File,
+			}
+
+			// 带重试的POC生成
+			for retry := 0; retry <= req.MaxRetries; retry++ {
+				poc := generatePOC(v, s.client, s.modelName, s.maxTokens, s.temperature)
+				if poc != "" {
+					pocResult.POC = poc
+					pocResult.Success = true
+					break
+				}
+
+				// 失败后等待重试
+				if retry < req.MaxRetries {
+					time.Sleep(time.Duration(retry+1) * time.Second)
+				}
+			}
+
+			if !pocResult.Success {
+				pocResult.ErrorMessage = "POC生成失败"
+			}
+
+			mu.Lock()
+			result.Results[index] = pocResult
+			if pocResult.Success {
+				result.SuccessCount++
+			} else {
+				result.FailedCount++
+			}
+			mu.Unlock()
+
+		}(i, vuln)
+	}
+
+	wg.Wait()
+	result.TotalDuration = time.Since(startTime)
+
+	return result
+}
+
+// ==================== POC异步生成功能 ====================
+
+// POCAsyncRequest POC异步生成请求
+type POCAsyncRequest struct {
+	Vulnerabilities []AuditResult            `json:"vulnerabilities"`
+	TaskID          string                   `json:"taskId"`
+	OnProgress      func(current, total int) `json:"-"` // 进度回调
+}
+
+// POCAsyncJob POC异步任务
+type POCAsyncJob struct {
+	ID          string                `json:"id"`
+	Request     POCAsyncRequest       `json:"request"`
+	Status      string                `json:"status"` // pending, running, completed, failed
+	Progress    int                   `json:"progress"`
+	Current     int                   `json:"current"`
+	Total       int                   `json:"total"`
+	Results     []POCGenerationResult `json:"results"`
+	Error       string                `json:"error,omitempty"`
+	CreatedAt   time.Time             `json:"createdAt"`
+	CompletedAt *time.Time            `json:"completedAt,omitempty"`
+}
+
+// pocJobs 全局POC异步任务存储
+var pocJobs = make(map[string]*POCAsyncJob)
+var pocJobsMu sync.RWMutex
+
+// GeneratePOCAsync 异步生成POC（后台运行）
+func (s *AuditService) GeneratePOCAsync(req POCAsyncRequest) string {
+	jobID := fmt.Sprintf("poc_%d", time.Now().UnixNano())
+
+	job := &POCAsyncJob{
+		ID:        jobID,
+		Request:   req,
+		Status:    "pending",
+		Progress:  0,
+		Current:   0,
+		Total:     len(req.Vulnerabilities),
+		Results:   make([]POCGenerationResult, len(req.Vulnerabilities)),
+		CreatedAt: time.Now(),
+	}
+
+	// 保存任务
+	pocJobsMu.Lock()
+	pocJobs[jobID] = job
+	pocJobsMu.Unlock()
+
+	// 后台执行
+	go func() {
+		s.runPOCGenerationJob(job)
+	}()
+
+	return jobID
+}
+
+// runPOCGenerationJob 执行POC生成任务
+func (s *AuditService) runPOCGenerationJob(job *POCAsyncJob) {
+	job.Status = "running"
+
+	for i, vuln := range job.Request.Vulnerabilities {
+		// 检查任务是否被取消
+		pocJobsMu.RLock()
+		currentJob := pocJobs[job.ID]
+		pocJobsMu.RUnlock()
+
+		if currentJob.Status == "failed" {
+			return
+		}
+
+		pocResult := POCGenerationResult{
+			Index:    i,
+			VulnType: extractVulnTypeFromAnalysis(vuln.Analysis),
+			FilePath: vuln.File,
+		}
+
+		// 生成POC
+		poc := generatePOC(vuln, s.client, s.modelName, s.maxTokens, s.temperature)
+		if poc != "" {
+			pocResult.POC = poc
+			pocResult.Success = true
+		} else {
+			pocResult.ErrorMessage = "POC生成失败"
+		}
+
+		// 更新结果
+		job.Results[i] = pocResult
+		job.Current = i + 1
+		job.Progress = (i + 1) * 100 / job.Total
+
+		// 调用进度回调
+		if job.Request.OnProgress != nil {
+			job.Request.OnProgress(job.Current, job.Total)
+		}
+
+		// 短暂休息，避免API限流
+		time.Sleep(200 * time.Millisecond)
+	}
+
+	// 标记完成
+	job.Status = "completed"
+	now := time.Now()
+	job.CompletedAt = &now
+}
+
+// GetPOCJobStatus 获取POC异步任务状态
+func (s *AuditService) GetPOCJobStatus(jobID string) (*POCAsyncJob, bool) {
+	pocJobsMu.RLock()
+	defer pocJobsMu.RUnlock()
+
+	job, exists := pocJobs[jobID]
+	if !exists {
+		return nil, false
+	}
+
+	// 返回副本，避免竞争
+	jobCopy := *job
+	jobCopy.Results = make([]POCGenerationResult, len(job.Results))
+	copy(jobCopy.Results, job.Results)
+
+	return &jobCopy, true
+}
+
+// CancelPOCJob 取消POC异步任务
+func (s *AuditService) CancelPOCJob(jobID string) bool {
+	pocJobsMu.Lock()
+	defer pocJobsMu.Unlock()
+
+	job, exists := pocJobs[jobID]
+	if !exists {
+		return false
+	}
+
+	if job.Status == "running" {
+		job.Status = "failed"
+		job.Error = "任务被取消"
+		return true
+	}
+
+	return false
+}
+
+// ListPOCJobs 列出所有POC异步任务
+func (s *AuditService) ListPOCJobs() []*POCAsyncJob {
+	pocJobsMu.RLock()
+	defer pocJobsMu.RUnlock()
+
+	jobs := make([]*POCAsyncJob, 0, len(pocJobs))
+	for _, job := range pocJobs {
+		jobs = append(jobs, job)
+	}
+
+	return jobs
 }
