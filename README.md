@@ -1,6 +1,6 @@
 # 🔒 AI 代码审计平台
 
-[English](./README_en.md) | 简体中文
+
 
 一个基于 AI 的自动化代码审计平台，支持多种编程语言的漏洞检测、跨文件调用链分析和实时审计报告生成。
 
@@ -66,12 +66,6 @@ cd platform
 
 ### 2. 配置环境变量
 
-复制并编辑配置文件：
-
-```bash
-cp .env.example .env
-```
-
 编辑 `.env` 文件，配置必要的参数：
 
 ```env
@@ -95,18 +89,7 @@ SMTP_PORT=465
 
 ### 3. 构建并启动
 
-```bash
-# 构建前端
-cd frontend
-npm install
-npm run build
-cd ..
-
-# 启动所有服务
-docker-compose up -d
-```
-
-或者直接使用 Docker Compose 启动：
+直接使用 Docker Compose 启动：
 
 ```bash
 docker-compose up -d --build
@@ -162,57 +145,7 @@ docker-compose up -d --build
 - 漏洞详情（位置、严重程度、修复建议）
 - 生成的 Markdown 报告
 
-## 🐳 Docker 部署
-
-### 前置要求
-- Docker 20.10+
-- Docker Compose 2.0+
-
-### 构建镜像
-
-```bash
-# 构建后端镜像
-docker build -t platform-backend ./backend
-
-# 前端需要先构建
-cd frontend
-npm install && npm run build
-cd ..
-docker build -t platform-frontend ./frontend
-```
-
-### 使用 Docker Compose
-
-```yaml
-# docker-compose.yml 示例
-services:
-  postgres:
-    image: postgres:15-alpine
-    environment:
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      POSTGRES_DB: ${POSTGRES_DB}
-    volumes:
-      - postgres-data:/var/lib/postgresql/data
-
-  backend:
-    build: ./backend
-    depends_on:
-      - postgres
-    environment:
-      - DATABASE_URL=postgres://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres:5432/${POSTGRES_DB}?sslmode=disable
-
-  frontend:
-    build: ./frontend
-    ports:
-      - "80:80"
-
-volumes:
-  postgres-data:
-```
-
 ## 📁 项目结构
-
 ```
 platform/
 ├── backend/                    # 后端服务
@@ -309,19 +242,5 @@ platform/
 5. 创建 Pull Request
 
 ## 📄 许可证
-
 本项目采用 ISC 许可证。详见 [LICENSE](LICENSE) 文件。
 
-## 🙏 致谢
-
-- [Gin](https://github.com/gin-gonic/gin) - Go Web 框架
-- [Vue.js](https://vuejs.org/) - 渐进式 JavaScript 框架
-- [Element Plus](https://element-plus.org/) - Vue 3 UI 组件库
-- [ECharts](https://echarts.apache.org/) - 数据可视化图表库
-- [Cytoscape.js](https://js.cytoscape.org/) - 图可视化库
-
----
-
-<p align="center">
-  <strong>Made with ❤️ by AI Code Audit Team</strong>
-</p>
