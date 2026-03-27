@@ -44,7 +44,7 @@ SMTP_PORT=465
 直接使用 Docker Compose 启动：
 
 ```bash
-docker-compose up -d --build
+docker compose up -d 
 ```
 
 ### 4. 访问平台
