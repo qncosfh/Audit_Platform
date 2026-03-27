@@ -17,7 +17,7 @@ services:
       retries: 5
     volumes:
       - ./init-scripts:/docker-entrypoint-initdb.d:ro
-      - postgres-data:/var/lib/postgresql/data
+      #- postgres-data:/var/lib/postgresql/data
     networks:
       - platform-network
 
@@ -57,5 +57,5 @@ networks:
   platform-network:
     driver: bridge
 
-volumes:
-  postgres-data:
+#volumes:
+  #postgres-data:
