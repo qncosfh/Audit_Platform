@@ -1616,7 +1616,7 @@ func (c *CallGraphAnalyzer) GetExploitChainData(vulnFile string, vulnLine int, v
 
 	for _, chain := range chains {
 		for i, step := range chain.Steps {
-			nodeID := fmt.Sprintf("step_%d_%s", chain.ID, step.NodeType)
+			nodeID := fmt.Sprintf("step_%s_%s", chain.ID, step.NodeType)
 
 			// 添加节点
 			label := step.MethodName
@@ -1642,7 +1642,7 @@ func (c *CallGraphAnalyzer) GetExploitChainData(vulnFile string, vulnLine int, v
 
 			// 添加边
 			if i > 0 {
-				prevNodeID := fmt.Sprintf("step_%d_%s", chain.ID, chain.Steps[i-1].NodeType)
+				prevNodeID := fmt.Sprintf("step_%s_%s", chain.ID, chain.Steps[i-1].NodeType)
 				edges = append(edges, map[string]interface{}{
 					"id":     fmt.Sprintf("edge_%s_%d", chain.ID, i),
 					"source": prevNodeID,
@@ -1792,7 +1792,7 @@ func (c *CallGraphAnalyzer) GetCrossFileContext(filePath string, methodName stri
 			displayPoints = displayPoints[:5]
 		}
 		for _, ep := range displayPoints {
-			ctx.WriteString(fmt.Sprintf("- %s\n", ep))
+			ctx.WriteString(fmt.Sprintf("- 文件: %s, 类型: %s\n", filepath.Base(ep.Node.FilePath), ep.Type))
 		}
 	} else {
 		ctx.WriteString("无\n")
@@ -1808,7 +1808,7 @@ func (c *CallGraphAnalyzer) GetCrossFileContext(filePath string, methodName stri
 			displaySinks = displaySinks[:5]
 		}
 		for _, sink := range displaySinks {
-			ctx.WriteString(fmt.Sprintf("- %s\n", sink))
+			ctx.WriteString(fmt.Sprintf("- 文件: %s, 漏洞类型: %s\n", filepath.Base(sink.Node.FilePath), sink.VulnType))
 		}
 	} else {
 		ctx.WriteString("无\n")
@@ -2574,7 +2574,9 @@ func (c *CallGraphAnalyzer) GenerateTextCallGraph(entryFunc string) string {
 		entryPoints = entryPoints[:10]
 	}
 	for _, ep := range entryPoints {
-		result.WriteString(fmt.Sprintf("  - %s\n", ep))
+		if ep != nil && ep.Node != nil {
+			result.WriteString(fmt.Sprintf("  - 文件: %s, 类型: %s\n", filepath.Base(ep.Node.FilePath), ep.Type))
+		}
 	}
 
 	result.WriteString("\n危险Sink点:\n")
@@ -2583,7 +2585,9 @@ func (c *CallGraphAnalyzer) GenerateTextCallGraph(entryFunc string) string {
 		sinkPoints = sinkPoints[:10]
 	}
 	for _, sink := range sinkPoints {
-		result.WriteString(fmt.Sprintf("  - %s\n", sink))
+		if sink != nil && sink.Node != nil {
+			result.WriteString(fmt.Sprintf("  - 文件: %s, 漏洞类型: %s\n", filepath.Base(sink.Node.FilePath), sink.VulnType))
+		}
 	}
 
 	return result.String()

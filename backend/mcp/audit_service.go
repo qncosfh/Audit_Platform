@@ -1130,18 +1130,35 @@ func (s *AuditService) verifyVulnerability(vuln AuditResult, sourcePath string) 
 	// 读取实际的代码内容（增强复查准确性）
 	codeContent := ""
 	if vuln.File != "" && vuln.File != "跨文件分析" {
-		// 尝试读取文件内容
+		// vuln.File 可能是完整路径（如 ./sandbox/audit-sandbox/3/项目名/xxx.java）
+		// 也可能是相对路径，尝试多种方式读取
 		fullPath := vuln.File
-		if !filepath.IsAbs(fullPath) {
-			// 如果是相对路径，尝试构建完整路径
-			fullPath = filepath.Join(sourcePath, vuln.File)
-		}
-
 		content, err := os.ReadFile(fullPath)
 		if err != nil {
-			// 尝试清理路径后重试
-			cleanPath := cleanFilePathForRead(fullPath)
-			content, err = os.ReadFile(cleanPath)
+			// filePath 可能是完整路径，检查是否包含 sourcePath
+			if strings.Contains(vuln.File, sourcePath) {
+				fullPath = vuln.File
+			} else {
+				// 尝试提取相对路径：去掉 audit-sandbox/{id}/ 前面的部分
+				parts := strings.SplitAfter(vuln.File, "audit-sandbox/")
+				if len(parts) >= 2 {
+					relAfterID := parts[len(parts)-1]
+					idParts := strings.SplitN(relAfterID, "/", 2)
+					if len(idParts) >= 2 {
+						fullPath = filepath.Join(sourcePath, idParts[1])
+					} else {
+						fullPath = vuln.File
+					}
+				} else {
+					fullPath = vuln.File
+				}
+			}
+			content, err = os.ReadFile(fullPath)
+			if err != nil {
+				// 尝试清理路径后重试
+				cleanPath := cleanFilePathForRead(fullPath)
+				content, err = os.ReadFile(cleanPath)
+			}
 		}
 
 		if err == nil {
@@ -2088,7 +2105,7 @@ func (s *AuditService) generateCustomReport(results []AuditResult, sourcePath, u
 		for i, r := range results {
 			fmt.Printf("[POC生成] 正在为漏洞 %d 生成POC: %s\n", i+1, r.File)
 
-			poc := generatePOC(r, s.client, s.modelName, s.maxTokens, s.temperature)
+			poc := generatePOC(r, s.client, s.modelName, s.maxTokens, s.temperature, sourcePath)
 			if poc != "" {
 				// POC已经是完整格式（包含代码块），直接输出
 				pocSection.WriteString(fmt.Sprintf("### 漏洞 %d: %s [%s]\n\n", i+1, r.Type, r.Severity))
@@ -2448,14 +2465,11 @@ func getVulnerabilityPrerequisite(vulnType string) string {
 var pocGenLogger = log.New(os.Stdout, "[POC生成] ", log.LstdFlags)
 
 // generatePOC 生成漏洞验证POC（增强版）
-func generatePOC(r AuditResult, client *openai.Client, modelName string, maxTokens int, temperature float32) string {
+func generatePOC(r AuditResult, client *openai.Client, modelName string, maxTokens int, temperature float32, sourcePath string) string {
 	if client == nil {
 		pocGenLogger.Print("跳过: client为nil")
 		return ""
 	}
-
-	// 提取漏洞代码片段 - 改进提取逻辑
-	codeSnippet := extractCodeSnippetEnhanced(r.Analysis, r.File)
 
 	// 提取漏洞类型和严重程度
 	vulnType := extractVulnTypeFromAnalysis(r.Analysis)
@@ -2464,6 +2478,18 @@ func generatePOC(r AuditResult, client *openai.Client, modelName string, maxToke
 	// 提取行号信息
 	lineNum := extractLineNumber(r.Analysis)
 
+	// 优先直接从源文件读取代码片段
+	codeSnippet := ""
+	if sourcePath != "" && r.File != "" && r.File != "跨文件分析" {
+		codeSnippet = readSourceCodeSnippet(sourcePath, r.File, r.Line)
+	}
+
+	// 如果从源文件读取失败，回退到从AI分析结果中提取
+	if codeSnippet == "" {
+		codeSnippet = extractCodeSnippetEnhanced(r.Analysis, r.File)
+		pocGenLogger.Printf("从源文件读取失败，回退到从AI分析结果提取: %s", r.File)
+	}
+
 	// 调用AI生成POC - 优化提示词，生成标准格式POC
 	prompt := "请为以下漏洞生成可执行的验证POC。\n\n" +
 		"## 漏洞基本信息\n" +
@@ -2471,8 +2497,8 @@ func generatePOC(r AuditResult, client *openai.Client, modelName string, maxToke
 		"- **严重等级**: " + severity + "\n" +
 		"- **文件位置**: " + r.File + "\n" +
 		"- **代码行号**: " + lineNum + "\n\n" +
-		"## 漏洞代码片段\n" +
-		"```\n" + codeSnippet + "\n```\n\n" +
+		"## 漏洞代码片段（从源代码提取）\n" +
+		"```java\n" + codeSnippet + "\n```\n\n" +
 		"## AI分析详情\n" +
 		r.Analysis + "\n\n" +
 		"## POC生成要求（必须严格遵守）\n\n" +
@@ -2529,6 +2555,119 @@ func generatePOC(r AuditResult, client *openai.Client, modelName string, maxToke
 
 	pocGenLogger.Printf("成功生成POC，漏洞类型: %s, 文件: %s", vulnType, r.File)
 	return content
+}
+
+// readSourceCodeSnippet 从源文件读取代码片段（包含漏洞行的上下文）
+// filePath 是 AuditResult.File，来自 ListCodeFiles，是完整路径
+// sourcePath 是 sandbox/audit-sandbox/{taskID}
+func readSourceCodeSnippet(sourcePath, filePath string, lineNumber int) string {
+	if sourcePath == "" || filePath == "" {
+		return ""
+	}
+
+	var fullPath string
+	var content []byte
+	var err error
+
+	// 智能路径处理：filePath 可能是完整路径或相对路径
+	// 1. 直接尝试 filePath（ListCodeFiles 返回的完整路径）
+	fullPath = filePath
+	content, err = os.ReadFile(fullPath)
+	if err == nil {
+		// 成功读取，直接使用
+	} else {
+		// 2. 如果 filePath 不存在，检查它是否包含 sourcePath 前缀
+		// filePath 可能是: ./sandbox/audit-sandbox/3/项目名/.../xxx.cs
+		// sourcePath 是: ./sandbox/audit-sandbox/3
+		if strings.Contains(filePath, sourcePath) {
+			// filePath 已经包含 sourcePath，直接使用
+			fullPath = filePath
+		} else {
+			// 3. 尝试提取相对路径：去掉 audit-sandbox/{id}/ 前面的部分
+			// filePath 可能是: /xxx/sandbox/audit-sandbox/3/项目名/.../xxx.cs
+			// 需要提取: 项目名/.../xxx.cs
+			parts := strings.SplitAfter(filePath, "audit-sandbox/")
+			if len(parts) >= 2 {
+				// parts[0] = "/xxx/sandbox/audit-sandbox/"
+				// parts[1] = "3/项目名/.../xxx.cs"
+				relAfterID := parts[len(parts)-1]
+				// 去掉开头的任务ID部分 (如 "3/项目名/..." -> "项目名/...")
+				idParts := strings.SplitN(relAfterID, "/", 2)
+				if len(idParts) >= 2 {
+					fullPath = filepath.Join(sourcePath, idParts[1])
+				} else {
+					fullPath = filePath
+				}
+			} else {
+				// 4. 最后尝试：直接拼接 sourcePath + filePath
+				fullPath = filepath.Join(sourcePath, filepath.Base(filePath))
+			}
+		}
+
+		content, err = os.ReadFile(fullPath)
+		if err == nil {
+			// 成功
+		} else {
+			// 5. 尝试在 decompiled 目录下查找
+			decompiledPath := filepath.Join(sourcePath, "decompiled", filepath.Base(filePath))
+			content, err = os.ReadFile(decompiledPath)
+			if err == nil {
+				fullPath = decompiledPath
+			} else {
+				// 6. 在 sourcePath 下递归查找同名文件
+				found := false
+				filepath.Walk(sourcePath, func(path string, info os.FileInfo, walkErr error) error {
+					if walkErr != nil || info.IsDir() {
+						return nil
+					}
+					if info.Name() == filepath.Base(filePath) {
+						content, err = os.ReadFile(path)
+						if err == nil {
+							fullPath = path
+							found = true
+							return filepath.SkipAll
+						}
+					}
+					return nil
+				})
+
+				if !found {
+					pocGenLogger.Printf("无法读取源文件: filePath=%s, sourcePath=%s, 错误: %v", filePath, sourcePath, err)
+					return ""
+				}
+			}
+		}
+	}
+
+	lines := strings.Split(string(content), "\n")
+	if len(lines) == 0 {
+		return ""
+	}
+
+	// 确定要提取的行范围（漏洞行前后各15行）
+	startLine := lineNumber - 15
+	endLine := lineNumber + 15
+
+	if startLine < 1 {
+		startLine = 1
+	}
+	if endLine > len(lines) {
+		endLine = len(lines)
+	}
+
+	// 提取代码片段
+	var snippetLines []string
+	for i := startLine; i <= endLine; i++ {
+		prefix := ""
+		if i == lineNumber {
+			prefix = ">>> " // 标记漏洞所在行
+		} else {
+			prefix = "    "
+		}
+		snippetLines = append(snippetLines, fmt.Sprintf("%s%4d: %s", prefix, i, lines[i-1]))
+	}
+
+	return strings.Join(snippetLines, "\n")
 }
 
 // extractCodeSnippetEnhanced 增强版代码片段提取（用于POC生成）
@@ -4087,6 +4226,7 @@ type POCGenerationResult struct {
 }
 
 // BatchGeneratePOC 批量生成POC（并发优化版）
+// 注意：此方法不传入sourcePath，POC生成时无法读取源文件
 func (s *AuditService) BatchGeneratePOC(req POCBatchRequest) POCBatchResult {
 	startTime := time.Now()
 	result := POCBatchResult{
@@ -4122,9 +4262,9 @@ func (s *AuditService) BatchGeneratePOC(req POCBatchRequest) POCBatchResult {
 				FilePath: v.File,
 			}
 
-			// 带重试的POC生成
+			// 带重试的POC生成（不传sourcePath，回退到从AI分析结果提取）
 			for retry := 0; retry <= req.MaxRetries; retry++ {
-				poc := generatePOC(v, s.client, s.modelName, s.maxTokens, s.temperature)
+				poc := generatePOC(v, s.client, s.modelName, s.maxTokens, s.temperature, "")
 				if poc != "" {
 					pocResult.POC = poc
 					pocResult.Success = true
@@ -4234,8 +4374,8 @@ func (s *AuditService) runPOCGenerationJob(job *POCAsyncJob) {
 			FilePath: vuln.File,
 		}
 
-		// 生成POC
-		poc := generatePOC(vuln, s.client, s.modelName, s.maxTokens, s.temperature)
+		// 生成POC（不传sourcePath，回退到从AI分析结果提取）
+		poc := generatePOC(vuln, s.client, s.modelName, s.maxTokens, s.temperature, "")
 		if poc != "" {
 			pocResult.POC = poc
 			pocResult.Success = true
