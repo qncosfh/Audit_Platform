@@ -1119,7 +1119,7 @@ func extractDangerousFunction(analysis string) string {
 
 // ==================== 漏洞复查验证逻辑 ====================
 
-// verifyVulnerability 复查验证单个漏洞
+// verifyVulnerability 复查验证单个漏洞（增强版：包含实际代码内容）
 func (s *AuditService) verifyVulnerability(vuln AuditResult, sourcePath string) (bool, string) {
 	// 提取漏洞类型
 	vulnType := extractVulnerabilityName(vuln.Analysis)
@@ -1127,31 +1127,42 @@ func (s *AuditService) verifyVulnerability(vuln AuditResult, sourcePath string) 
 		vulnType = vuln.Type
 	}
 
-	// 构造验证提示词
-	verifyPrompt := fmt.Sprintf(`你是资深代码安全审计专家，请复查以下漏洞是否真实存在。
+	// 读取实际的代码内容（增强复查准确性）
+	codeContent := ""
+	if vuln.File != "" && vuln.File != "跨文件分析" {
+		// 尝试读取文件内容
+		fullPath := vuln.File
+		if !filepath.IsAbs(fullPath) {
+			// 如果是相对路径，尝试构建完整路径
+			fullPath = filepath.Join(sourcePath, vuln.File)
+		}
 
-## 漏洞信息
-- **漏洞类型**: %s
-- **文件位置**: %s
-- **分析详情**: %s
+		content, err := os.ReadFile(fullPath)
+		if err != nil {
+			// 尝试清理路径后重试
+			cleanPath := cleanFilePathForRead(fullPath)
+			content, err = os.ReadFile(cleanPath)
+		}
 
-## 复查要求
-请从以下角度进行严格复查：
+		if err == nil {
+			// 限制代码内容长度（避免token过多）
+			codeStr := string(content)
+			if len(codeStr) > 8000 {
+				codeStr = codeStr[:8000] + "\n... [代码过长，已截断]"
+			}
+			codeContent = codeStr
+		}
+	}
 
-1. **输入验证**: 代码中是否有明确的用户输入点（请求参数、请求体、URL路径、文件上传等）
-2. **危险函数**: 用户输入是否真的进入了危险函数/危险操作
-3. **安全措施**: 是否存在有效的输入验证、过滤、转义或参数化处理
-4. **利用条件**: 该漏洞是否真的可以被实际利用
-
-## 判断标准
-- 如果以上4个条件**全部满足**，返回"验证通过"
-- 如果任何一个条件**不满足**，返回"误报"并说明原因
-
-请直接返回以下格式：
-- 验证通过：该漏洞真实存在，可以利用
-- 误报：[具体原因]
-
-注意：请严格审查，宁可误报也不放过任何可能的真实漏洞。`, vulnType, vuln.File, vuln.Analysis)
+	// 根据是否有代码内容选择不同的提示词
+	var verifyPrompt string
+	if codeContent != "" {
+		// 有代码内容，使用更详细的提示词
+		verifyPrompt = fmt.Sprintf("你是资深代码安全审计专家，请复查以下漏洞是否真实存在。\n\n## 漏洞信息\n- **漏洞类型**: %s\n- **文件位置**: %s\n- **分析详情**: %s\n\n## 实际代码内容\n```java\n%s\n```\n\n## 复查要求\n请结合上述**实际代码内容**进行严格复查，重点检查：\n\n1. **输入验证**: 代码中是否有明确的用户输入点（getParameter、@RequestParam、request.getHeader、@PathVariable等）\n2. **危险函数**: 用户输入是否真的进入了危险函数（executeQuery、exec、include、readObject等）\n3. **安全措施**: 是否存在有效的安全措施：\n   - MyBatis #{} 参数占位符（安全）\n   - PreparedStatement 参数化查询（安全）\n   - 白名单验证（安全）\n   - 硬编码路径或静态配置（安全）\n   - 无用户可控路径（安全）\n4. **利用条件**: 该漏洞是否真的可以被实际利用\n\n## 配置文件类判定标准\n对于以下类型的文件，**默认判定为误报**，除非有明确证据：\n- **Configuration配置类**（如 RedisConfig、MyBatisPlusConfiguration、Swagger2Config）：只包含配置参数，无用户输入处理\n- **Exception异常类**（如 XxxException）：只封装异常信息，无业务逻辑\n- **全局处理器**（如 GlobalExceptionHandler、SecurityInterceptor）：处理异常/安全检查，无直接漏洞利用点\n- **工具类/帮助类**：无用户输入处理逻辑\n\n## 判断标准\n- 如果以上4个条件**全部满足**，返回\"验证通过\"\n- 如果任何一个条件**不满足**，返回\"误报\"并说明具体原因\n\n请直接返回以下格式之一（不要添加任何前缀或解释）：\n- 验证通过：该漏洞真实存在，可以利用（简要说明原因）\n- 误报：[具体原因]\n\n注意：严格审查，对于配置类、异常类、工具类等无用户输入的文件，优先判定为误报。", vulnType, vuln.File, vuln.Analysis, codeContent)
+	} else {
+		// 没有代码内容，使用基础提示词
+		verifyPrompt = fmt.Sprintf("你是资深代码安全审计专家，请复查以下漏洞是否真实存在。\n\n## 漏洞信息\n- **漏洞类型**: %s\n- **文件位置**: %s\n- **分析详情**: %s\n\n## 复查要求\n请从以下角度进行严格复查：\n\n1. **输入验证**: 代码中是否有明确的用户输入点（请求参数、请求体、URL路径、文件上传等）\n2. **危险函数**: 用户输入是否真的进入了危险函数/危险操作\n3. **安全措施**: 是否存在有效的输入验证、过滤、转义或参数化处理\n4. **利用条件**: 该漏洞是否真的可以被实际利用\n\n## 配置文件类判定标准\n对于以下类型的文件，**默认判定为误报**：\n- **Configuration配置类**（如 RedisConfig、MyBatisPlusConfiguration、Swagger2Config、CORSConfiguration）\n- **Exception异常类**（如 XxxException）\n- **全局处理器**（如 GlobalExceptionHandler、SecurityInterceptor）\n- **AOP切面类**（如 LogTradeAop）\n\n## 判断标准\n- 如果以上4个条件**全部满足**，返回\"验证通过\"\n- 如果任何一个条件**不满足**，返回\"误报\"并说明原因\n\n请直接返回以下格式（不要添加任何前缀或解释）：\n- 验证通过：该漏洞真实存在，可以利用\n- 误报：[具体原因]\n\n注意：严格审查，对于配置类、异常类、工具类等无用户输入的文件，优先判定为误报。", vulnType, vuln.File, vuln.Analysis)
+	}
 
 	resp, err := s.client.CreateChatCompletion(
 		context.Background(),
@@ -2879,6 +2890,42 @@ func cleanFilePath(filePath string) string {
 		}
 	}
 	return cleanPath
+}
+
+// cleanFilePathForRead 清理文件路径用于实际读取（保留真实路径以便读取）
+func cleanFilePathForRead(filePath string) string {
+	// 如果是已清理的路径，尝试还原
+	// sandbox/[任务]/ -> sandbox/audit-sandbox/*/
+	re := regexp.MustCompile(`sandbox/\[任务\]/`)
+	cleanPath := re.ReplaceAllString(filePath, "sandbox/audit-sandbox/2/") // 使用通配符
+
+	// 如果路径已包含完整路径，直接返回
+	if strings.Contains(cleanPath, "decompiled") || strings.Contains(cleanPath, "src") {
+		return cleanPath
+	}
+
+	// 尝试查找真实路径
+	if strings.Contains(cleanPath, "sandbox/") {
+		// 提取相对路径部分
+		parts := strings.Split(cleanPath, "sandbox/")
+		if len(parts) > 1 {
+			relPath := parts[len(parts)-1]
+			// 尝试在多个可能的sandbox目录中查找
+			sandboxPatterns := []string{
+				"sandbox/audit-sandbox/1/",
+				"sandbox/audit-sandbox/2/",
+				"sandbox/audit-sandbox/3/",
+			}
+			for _, pattern := range sandboxPatterns {
+				testPath := pattern + relPath
+				if _, err := os.Stat(testPath); err == nil {
+					return testPath
+				}
+			}
+		}
+	}
+
+	return filePath
 }
 
 // updateTaskProgress 更新任务进度到数据库
