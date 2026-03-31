@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"platform/model"
 	"platform/util"
+	"platform/utils"
 	"regexp"
 	"runtime"
 	"strconv"
@@ -3289,7 +3290,7 @@ func (s *AuditService) ReadFileContent(filePath string) (string, error) {
 	}
 
 	// 尝试自动检测并转换编码
-	decodedContent := decodeUnicodeString(string(content))
+	decodedContent := utils.DecodeUnicodeString(string(content))
 	return decodedContent, nil
 }
 

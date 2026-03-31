@@ -3,11 +3,12 @@ package util
 import (
 	"crypto/tls"
 	"fmt"
-	"os"
 	"time"
 
 	"github.com/joho/godotenv"
 	"gopkg.in/gomail.v2"
+
+	"platform/utils"
 )
 
 // EmailConfig 邮件配置
@@ -43,12 +44,12 @@ func LoadEmailConfig() EmailConfig {
 	// 加载 .env 文件中的环境变量（从 backend/ 目录往上一级找到项目根目录的 .env）
 	godotenv.Load("../.env")
 
-	smtpServer := getEnv("SMTP_SERVER", "smtp.gmail.com")
-	smtpPort := getEnv("SMTP_PORT", "587")
-	smtpUsername := getEnv("SMTP_USERNAME", "")
-	smtpPassword := getEnv("SMTP_PASSWORD", "")
-	fromEmail := getEnv("FROM_EMAIL", "")
-	toEmail := getEnv("TO_EMAIL", "")
+	smtpServer := utils.GetEnv("SMTP_SERVER", "smtp.gmail.com")
+	smtpPort := utils.GetEnv("SMTP_PORT", "587")
+	smtpUsername := utils.GetEnv("SMTP_USERNAME", "")
+	smtpPassword := utils.GetEnv("SMTP_PASSWORD", "")
+	fromEmail := utils.GetEnv("FROM_EMAIL", "")
+	toEmail := utils.GetEnv("TO_EMAIL", "")
 
 	cachedEmailConfig = EmailConfig{
 		SMTPServer:   smtpServer,
@@ -63,15 +64,8 @@ func LoadEmailConfig() EmailConfig {
 	return cachedEmailConfig
 }
 
-// getEnv 获取环境变量
-func getEnv(key, defaultValue string) string {
-	if value, exists := os.LookupEnv(key); exists {
-		return value
-	}
-	return defaultValue
-}
-
 // SendEmail 发送邮件
+
 func SendEmail(to, subject, body string) error {
 	config := LoadEmailConfig()
 

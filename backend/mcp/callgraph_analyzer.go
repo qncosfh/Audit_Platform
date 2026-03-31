@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"platform/utils"
 	"regexp"
 	"sort"
 	"strings"
@@ -285,7 +286,7 @@ func (c *CallGraphAnalyzer) loadFiles() error {
 				return nil
 			}
 			// 解码 Unicode 转义序列
-			decoded := decodeUnicodeString(string(content))
+			decoded := utils.DecodeUnicodeString(string(content))
 			c.Files[path] = decoded
 		}
 

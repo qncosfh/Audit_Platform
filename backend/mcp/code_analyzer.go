@@ -5,9 +5,9 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"strconv"
 	"strings"
-	"unicode/utf8"
+
+	"platform/utils"
 )
 
 // MethodCall 方法调用关系
@@ -126,7 +126,7 @@ func NewCodeAnalyzer(sourcePath string) (*CodeAnalyzer, error) {
 				return nil
 			}
 			// 解码 Unicode 转义序列
-			decoded := decodeUnicodeString(string(content))
+			decoded := utils.DecodeUnicodeString(string(content))
 			analyzer.Files[path] = decoded
 		}
 		return nil
@@ -137,35 +137,6 @@ func NewCodeAnalyzer(sourcePath string) (*CodeAnalyzer, error) {
 	}
 
 	return analyzer, nil
-}
-
-// decodeUnicodeString 解码 Unicode 转义序列
-func decodeUnicodeString(s string) string {
-	re := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
-	result := re.ReplaceAllStringFunc(s, func(match string) string {
-		hex := match[2:]
-		code, err := strconv.ParseUint(hex, 16, 32)
-		if err != nil {
-			return match
-		}
-		return string(rune(code))
-	})
-
-	re2 := regexp.MustCompile(`\\U([0-9a-fA-F]{8})`)
-	result = re2.ReplaceAllStringFunc(result, func(match string) string {
-		hex := match[3:]
-		code, err := strconv.ParseUint(hex, 16, 32)
-		if err != nil {
-			return match
-		}
-		return string(rune(code))
-	})
-
-	if !utf8.ValidString(result) {
-		return s
-	}
-
-	return result
 }
 
 // detectLanguage 自动检测源代码语言

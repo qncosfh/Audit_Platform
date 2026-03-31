@@ -8,12 +8,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"regexp"
 	"runtime"
-	"strconv"
 	"strings"
 	"sync"
-	"unicode/utf8"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -21,6 +18,7 @@ import (
 	"platform/config"
 	"platform/model"
 	"platform/util"
+	"platform/utils"
 )
 
 type CodeSourceHandler struct{}
@@ -904,7 +902,7 @@ func (h *CodeSourceHandler) GetFile(c *gin.Context) {
 
 	// 解码 Unicode 转义序列
 	contentStr := string(content)
-	decodedContent := decodeUnicodeString(contentStr)
+	decodedContent := utils.DecodeUnicodeString(contentStr)
 
 	ext := filepath.Ext(filePath)
 	c.JSON(http.StatusOK, util.Success(gin.H{
@@ -915,35 +913,6 @@ func (h *CodeSourceHandler) GetFile(c *gin.Context) {
 		"content":  decodedContent,
 		"language": getLanguageByExt(ext),
 	}))
-}
-
-// decodeUnicodeString 解码 Unicode 转义序列
-func decodeUnicodeString(s string) string {
-	re := regexp.MustCompile(`\\u([0-9a-fA-F]{4})`)
-	result := re.ReplaceAllStringFunc(s, func(match string) string {
-		hex := match[2:]
-		code, err := strconv.ParseUint(hex, 16, 32)
-		if err != nil {
-			return match
-		}
-		return string(rune(code))
-	})
-
-	re2 := regexp.MustCompile(`\\U([0-9a-fA-F]{8})`)
-	result = re2.ReplaceAllStringFunc(result, func(match string) string {
-		hex := match[3:]
-		code, err := strconv.ParseUint(hex, 16, 32)
-		if err != nil {
-			return match
-		}
-		return string(rune(code))
-	})
-
-	if !utf8.ValidString(result) {
-		return s
-	}
-
-	return result
 }
 
 func (h *CodeSourceHandler) getFileFromArchive(userID uint, archivePath, relativePath string) string {
